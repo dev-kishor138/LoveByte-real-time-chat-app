@@ -1,0 +1,25 @@
+# Node dependencies
+node_modules/
+
+# TypeScript compilation output
+dist/
+
+# Test coverage
+coverage/
+
+# Environment secrets
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Generated Prisma Client
+/src/generated/prisma/
+
+# Neon CLI local state
+.neon/
+
+# Process logs
+*.log
+npm-debug.log*
+
