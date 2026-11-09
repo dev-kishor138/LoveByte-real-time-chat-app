@@ -203,8 +203,8 @@ export class ChatService {
       take: limit,
       ...(cursor ? { skip: 1, cursor: { id: cursor } } : {}),
       orderBy: [
-        { createdAt: "asc" },
-        { id: "asc" },
+        { createdAt: "desc" },
+        { id: "desc" },
       ],
       select: {
         id: true,
@@ -224,8 +224,13 @@ export class ChatService {
       },
     });
 
+    // Query retrieved the newest matching messages in descending order (or older than cursor).
+    // Reverse array to preserve the public API contract: ascending chronological order
+    // (oldest in the returned batch first, newest last).
+    const chronologicalMessages = messages.reverse();
+
     // Mask deleted message payload to protect privacy
-    return messages.map((msg) => ({
+    return chronologicalMessages.map((msg) => ({
       id: msg.id,
       conversationId: msg.conversationId,
       senderId: msg.senderId,
@@ -323,24 +328,29 @@ export class ChatService {
       const io = getIO();
       // 1. Deliver to recipient (whether in conversation room or personal room) exactly once.
       // Exclude sender's user room so the sender does not receive new_message for their own message.
+      // Strictly do not include clientMutationId in recipient's new_message payload.
       io.to(`conversation:${conversationId}`)
         .to(`user:${recipientId}`)
         .except(`user:${senderId}`)
         .emit("new_message", message);
 
-      // 2. Deliver confirmation to sender's other connected devices.
-      // If originatingSocketId is provided, exclude it so the initiating socket receives only ack.
+      // 2. Deliver confirmation to all connected devices in sender's personal room.
+      // Broadcast message_sent to user:${senderId} (including originating socket)
+      // so timeout recovery and multi-device state synchronization succeed deterministically.
       const senderTarget = io.to(`user:${senderId}`);
-      if (originatingSocketId) {
-        senderTarget.except(originatingSocketId).emit("message_sent", message);
-      } else {
-        senderTarget.emit("message_sent", message);
-      }
+      const senderPayload = {
+        ...message,
+        ...(input.clientMutationId ? { clientMutationId: input.clientMutationId } : {}),
+      };
+      senderTarget.emit("message_sent", senderPayload);
     } catch {
       // Socket instance might not be initialized during isolated unit tests
     }
 
-    return message;
+    return {
+      ...message,
+      ...(input.clientMutationId ? { clientMutationId: input.clientMutationId } : {}),
+    };
   }
 
   /**

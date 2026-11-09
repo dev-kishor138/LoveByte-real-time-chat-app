@@ -10,6 +10,7 @@ import {
 } from "./chat.validation";
 import { chatService } from "./chat.service";
 import { prisma } from "../../config/prisma";
+import * as sockets from "../../sockets";
 
 describe("Chat Module - Validation Unit Tests", () => {
   // 1. Email normalization
@@ -94,6 +95,18 @@ describe("Chat Module - Validation Unit Tests", () => {
     expect(sendMessageSchema.safeParse({ content: "Hello", type: "TEXT" }).success).toBe(true);
     expect(sendMessageSchema.safeParse({ content: "Hello", type: "IMAGE" as any }).success).toBe(false);
     expect(sendMessageSchema.safeParse({ content: "Hello", type: "VOICE" as any }).success).toBe(false);
+  });
+
+  // 7b. clientMutationId validation
+  it("7b. Validates optional clientMutationId canonical UUID format in sendMessage validation", () => {
+    const validUuid = "123e4567-e89b-12d3-a456-426614174000";
+    // Valid canonical UUID passes
+    expect(sendMessageSchema.safeParse({ content: "Hello", clientMutationId: validUuid }).success).toBe(true);
+    // Missing clientMutationId passes (optional)
+    expect(sendMessageSchema.safeParse({ content: "Hello" }).success).toBe(true);
+    // Malformed clientMutationId fails
+    expect(sendMessageSchema.safeParse({ content: "Hello", clientMutationId: "invalid-uuid" }).success).toBe(false);
+    expect(sendMessageSchema.safeParse({ content: "Hello", clientMutationId: 12345 as any }).success).toBe(false);
   });
 });
 
@@ -279,22 +292,7 @@ describe("Chat Module - Message Service", () => {
       user2Id,
     } as any);
 
-    const mockMessages = [
-      {
-        id: "m-1",
-        conversationId,
-        senderId: user1Id,
-        type: "TEXT",
-        content: "Active visible message",
-        fileKey: null,
-        fileMime: null,
-        fileSize: null,
-        isEdited: false,
-        editedAt: null,
-        isDeleted: false,
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      },
+    const mockMessagesDesc = [
       {
         id: "m-2",
         conversationId,
@@ -307,21 +305,38 @@ describe("Chat Module - Message Service", () => {
         isEdited: false,
         editedAt: null,
         isDeleted: true, // Deleted
-        createdAt: new Date(),
-        updatedAt: new Date(),
+        createdAt: new Date("2026-11-09T05:01:00Z"),
+        updatedAt: new Date("2026-11-09T05:01:00Z"),
+      },
+      {
+        id: "m-1",
+        conversationId,
+        senderId: user1Id,
+        type: "TEXT",
+        content: "Active visible message",
+        fileKey: null,
+        fileMime: null,
+        fileSize: null,
+        isEdited: false,
+        editedAt: null,
+        isDeleted: false,
+        createdAt: new Date("2026-11-09T05:00:00Z"),
+        updatedAt: new Date("2026-11-09T05:00:00Z"),
       },
     ];
 
-    vi.spyOn(prisma.message, "findMany").mockResolvedValueOnce(mockMessages as any);
+    vi.spyOn(prisma.message, "findMany").mockResolvedValueOnce(mockMessagesDesc as any);
 
     const result = await chatService.getConversationMessages(user1Id, conversationId, 50);
     expect(result.length).toBe(2);
 
-    // Active message retains content
+    // Reversed to ascending order: Active message m-1 first, deleted m-2 second
+    expect(result[0].id).toBe("m-1");
     expect(result[0].content).toBe("Active visible message");
     expect(result[0].isDeleted).toBe(false);
 
     // Deleted message payload is strictly masked
+    expect(result[1].id).toBe("m-2");
     expect(result[1].content).toBeNull();
     expect(result[1].fileKey).toBeNull();
     expect(result[1].fileMime).toBeNull();
@@ -457,6 +472,90 @@ describe("Chat Module - Message Service", () => {
     expect(sent.id).toBe("tx-msg-id");
     expect(mockTxMessageCreate).toHaveBeenCalledTimes(1);
     expect(mockTxConversationUpdate).toHaveBeenCalledTimes(1);
+  });
+
+  // 15d. Echoes clientMutationId in return value and message_sent event, while omitting from recipient new_message
+  it("15d. Echoes clientMutationId in return value and message_sent event, while omitting from recipient new_message", async () => {
+    vi.spyOn(prisma.conversation, "findUnique").mockResolvedValueOnce({
+      user1Id,
+      user2Id,
+    } as any);
+
+    const clientMutationId = "123e4567-e89b-12d3-a456-426614174000";
+    const messageMock = {
+      id: "msg-with-mutation-id",
+      conversationId,
+      senderId: user1Id,
+      type: "TEXT",
+      content: "Hello with clientMutationId",
+      fileKey: null,
+      fileMime: null,
+      fileSize: null,
+      isEdited: false,
+      editedAt: null,
+      isDeleted: false,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+
+    vi.spyOn(prisma.message, "create").mockResolvedValueOnce(messageMock as any);
+    vi.spyOn(prisma.conversation, "update").mockResolvedValueOnce({} as any);
+
+    const emittedEvents: Array<{ event: string; payload: any; rooms: string[]; excluded: string[] }> = [];
+    let currentRooms: string[] = [];
+    let currentExcluded: string[] = [];
+    const mockOperator: any = {
+      to: vi.fn((r: string) => {
+        currentRooms.push(r);
+        return mockOperator;
+      }),
+      except: vi.fn((r: string) => {
+        currentExcluded.push(r);
+        return mockOperator;
+      }),
+      emit: vi.fn((event: string, payload: any) => {
+        emittedEvents.push({
+          event,
+          payload,
+          rooms: [...currentRooms],
+          excluded: [...currentExcluded],
+        });
+        return true;
+      }),
+    };
+    const mockIO: any = {
+      to: vi.fn((r: string) => {
+        currentRooms = [r];
+        currentExcluded = [];
+        return mockOperator;
+      }),
+    };
+
+    vi.spyOn(sockets, "getIO").mockReturnValue(mockIO);
+
+    const sent = await chatService.sendMessage(user1Id, conversationId, {
+      content: "Hello with clientMutationId",
+      type: "TEXT",
+      clientMutationId,
+    });
+
+    // 1. Return value includes clientMutationId
+    expect(sent.id).toBe("msg-with-mutation-id");
+    expect((sent as any).clientMutationId).toBe(clientMutationId);
+
+    // 2. Sender-side message_sent event includes clientMutationId
+    const sentEvent = emittedEvents.find((e) => e.event === "message_sent");
+    expect(sentEvent).toBeDefined();
+    expect(sentEvent?.payload.clientMutationId).toBe(clientMutationId);
+    expect(sentEvent?.rooms).toContain(`user:${user1Id}`);
+    expect(sentEvent?.excluded).toEqual([]); // not excluded, reaches all sender sockets
+
+    // 3. Recipient-side new_message event strictly OMITS clientMutationId
+    const newMsgEvent = emittedEvents.find((e) => e.event === "new_message");
+    expect(newMsgEvent).toBeDefined();
+    expect(newMsgEvent?.payload.clientMutationId).toBeUndefined();
+    expect(newMsgEvent?.rooms).toContain(`user:${user2Id}`);
+    expect(newMsgEvent?.excluded).toContain(`user:${user1Id}`);
   });
 
   // 16. Non-participant sending message rejected
@@ -651,8 +750,8 @@ describe("Chat Module - Message Service", () => {
     });
   });
 
-  // 24. Deterministic compound ordering in getConversationMessages (Stage 3.4.3)
-  it("24. getConversationMessages passes compound orderBy [{ createdAt: 'asc' }, { id: 'asc' }] to Prisma", async () => {
+  // 24. Deterministic compound ordering in getConversationMessages (Stage 3.3 Remediation)
+  it("24. getConversationMessages passes compound orderBy [{ createdAt: 'desc' }, { id: 'desc' }] to Prisma and reverses output to ascending", async () => {
     vi.spyOn(prisma.conversation, "findUnique").mockResolvedValueOnce({
       user1Id,
       user2Id,
@@ -667,14 +766,14 @@ describe("Chat Module - Message Service", () => {
         where: { conversationId },
         take: 25,
         orderBy: [
-          { createdAt: "asc" },
-          { id: "asc" },
+          { createdAt: "desc" },
+          { id: "desc" },
         ],
       })
     );
   });
 
-  // 25. Equal-timestamp pagination determinism without skipped or duplicate messages (Stage 3.4.3)
+  // 25. Equal-timestamp pagination determinism without skipped or duplicate messages (Stage 3.3 Remediation)
   it("25. Paginates deterministically across equal-timestamp messages using cursor and skip: 1 without duplicates or skips", async () => {
     const identicalTimestamp = new Date("2026-11-07T12:00:00.000Z");
 
@@ -742,55 +841,57 @@ describe("Chat Module - Message Service", () => {
       updatedAt: identicalTimestamp,
     };
 
-    // Page 1 query: limit = 2, no cursor -> returns message1, message2
+    // Page 1 query: limit = 2, no cursor -> Prisma queries newest records in DESC order: returns message4, message3
     vi.spyOn(prisma.conversation, "findUnique").mockResolvedValueOnce({
       user1Id,
       user2Id,
     } as any);
 
-    const findManySpy = vi.spyOn(prisma.message, "findMany").mockResolvedValueOnce([message1, message2] as any);
+    const findManySpy = vi.spyOn(prisma.message, "findMany").mockResolvedValueOnce([message4, message3] as any);
 
     const page1 = await chatService.getConversationMessages(user1Id, conversationId, 2);
 
     expect(findManySpy).toHaveBeenCalledWith(
       expect.objectContaining({
         take: 2,
-        orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
       })
     );
+    // Reversed by service to ascending chronological order
     expect(page1.length).toBe(2);
-    expect(page1[0].id).toBe("00000000-0000-0000-0000-000000000001");
-    expect(page1[1].id).toBe("00000000-0000-0000-0000-000000000002");
+    expect(page1[0].id).toBe("00000000-0000-0000-0000-000000000003");
+    expect(page1[1].id).toBe("00000000-0000-0000-0000-000000000004");
 
-    // Page 2 query: limit = 2, cursor = message2.id -> returns message3, message4
+    // Page 2 query: limit = 2, cursor = oldest in page1 (message3.id) -> returns older messages in DESC order: message2, message1
     vi.spyOn(prisma.conversation, "findUnique").mockResolvedValueOnce({
       user1Id,
       user2Id,
     } as any);
 
-    findManySpy.mockResolvedValueOnce([message3, message4] as any);
+    findManySpy.mockResolvedValueOnce([message2, message1] as any);
 
     const page2 = await chatService.getConversationMessages(
       user1Id,
       conversationId,
       2,
-      "00000000-0000-0000-0000-000000000002"
+      "00000000-0000-0000-0000-000000000003"
     );
 
     expect(findManySpy).toHaveBeenLastCalledWith(
       expect.objectContaining({
         take: 2,
         skip: 1,
-        cursor: { id: "00000000-0000-0000-0000-000000000002" },
-        orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+        cursor: { id: "00000000-0000-0000-0000-000000000003" },
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
       })
     );
+    // Reversed by service to ascending chronological order
     expect(page2.length).toBe(2);
-    expect(page2[0].id).toBe("00000000-0000-0000-0000-000000000003");
-    expect(page2[1].id).toBe("00000000-0000-0000-0000-000000000004");
+    expect(page2[0].id).toBe("00000000-0000-0000-0000-000000000001");
+    expect(page2[1].id).toBe("00000000-0000-0000-0000-000000000002");
 
-    // Verify union of both pages contains exactly all 4 messages with zero duplicates or skips
-    const combinedIds = [...page1.map((m) => m.id), ...page2.map((m) => m.id)];
+    // Prepending older page2 before page1 yields the complete ascending sequence with zero duplicates or skips
+    const combinedIds = [...page2.map((m) => m.id), ...page1.map((m) => m.id)];
     expect(combinedIds).toEqual([
       "00000000-0000-0000-0000-000000000001",
       "00000000-0000-0000-0000-000000000002",
@@ -800,7 +901,7 @@ describe("Chat Module - Message Service", () => {
     expect(new Set(combinedIds).size).toBe(4);
   });
 
-  // 26. Soft-deleted messages masked properly across equal-timestamp pages (Stage 3.4.3)
+  // 26. Soft-deleted messages masked properly across equal-timestamp pages (Stage 3.3 Remediation)
   it("26. Preserves soft-deleted message positions as masked tombstones during equal-timestamp pagination", async () => {
     const timestamp = new Date("2026-11-07T12:30:00.000Z");
 
@@ -841,17 +942,18 @@ describe("Chat Module - Message Service", () => {
       user2Id,
     } as any);
 
-    vi.spyOn(prisma.message, "findMany").mockResolvedValueOnce([activeMsg, deletedMsg] as any);
+    // In descending DB order: deletedMsg (...11) comes first, activeMsg (...10) comes second
+    vi.spyOn(prisma.message, "findMany").mockResolvedValueOnce([deletedMsg, activeMsg] as any);
 
     const result = await chatService.getConversationMessages(user1Id, conversationId, 10);
 
     expect(result.length).toBe(2);
-    // Active message
+    // Reversed by service: active message (...10) is first
     expect(result[0].id).toBe("00000000-0000-0000-0000-000000000010");
     expect(result[0].content).toBe("Visible message");
     expect(result[0].isDeleted).toBe(false);
 
-    // Deleted tombstone
+    // Deleted tombstone (...11) is second
     expect(result[1].id).toBe("00000000-0000-0000-0000-000000000011");
     expect(result[1].content).toBeNull();
     expect(result[1].fileKey).toBeNull();
@@ -859,6 +961,52 @@ describe("Chat Module - Message Service", () => {
     expect(result[1].fileSize).toBeNull();
     expect(result[1].isDeleted).toBe(true);
     expect(result[1].createdAt).toEqual(timestamp);
+  });
+
+  // 27. Message pagination edge cases: initial load latest messages, older cursor, boundary page behavior (Stage 3.3 Remediation)
+  it("27. Initial request returns latest limit messages in ascending order; older cursor returns strictly older messages", async () => {
+    const t1 = new Date("2026-11-09T01:00:00Z");
+    const t2 = new Date("2026-11-09T02:00:00Z");
+    const t3 = new Date("2026-11-09T03:00:00Z");
+    const t4 = new Date("2026-11-09T04:00:00Z");
+    const t5 = new Date("2026-11-09T05:00:00Z");
+
+    const m1 = { id: "m-01", conversationId, senderId: user1Id, type: "TEXT" as const, content: "Msg 1", isDeleted: false, createdAt: t1, updatedAt: t1 };
+    const m2 = { id: "m-02", conversationId, senderId: user2Id, type: "TEXT" as const, content: "Msg 2", isDeleted: false, createdAt: t2, updatedAt: t2 };
+    const m3 = { id: "m-03", conversationId, senderId: user1Id, type: "TEXT" as const, content: "Msg 3", isDeleted: false, createdAt: t3, updatedAt: t3 };
+    const m4 = { id: "m-04", conversationId, senderId: user2Id, type: "TEXT" as const, content: "Msg 4", isDeleted: false, createdAt: t4, updatedAt: t4 };
+    const m5 = { id: "m-05", conversationId, senderId: user1Id, type: "TEXT" as const, content: "Msg 5", isDeleted: false, createdAt: t5, updatedAt: t5 };
+
+    // Initial page query: limit = 3, no cursor -> Prisma returns [m5, m4, m3] (the 3 newest)
+    vi.spyOn(prisma.conversation, "findUnique").mockResolvedValueOnce({ user1Id, user2Id } as any);
+    const findManySpy = vi.spyOn(prisma.message, "findMany").mockResolvedValueOnce([m5, m4, m3] as any);
+
+    const initialBatch = await chatService.getConversationMessages(user1Id, conversationId, 3);
+    // Service returns [m3, m4, m5] in ascending chronological order
+    expect(initialBatch.map((m) => m.id)).toEqual(["m-03", "m-04", "m-05"]);
+    expect(initialBatch[0].createdAt).toEqual(t3);
+    expect(initialBatch[2].createdAt).toEqual(t5);
+
+    // Older cursor query: limit = 3, cursor = oldest from initialBatch ("m-03")
+    vi.spyOn(prisma.conversation, "findUnique").mockResolvedValueOnce({ user1Id, user2Id } as any);
+    findManySpy.mockResolvedValueOnce([m2, m1] as any);
+
+    const olderBatch = await chatService.getConversationMessages(user1Id, conversationId, 3, "m-03");
+    // Service returns [m1, m2] in ascending chronological order
+    expect(olderBatch.map((m) => m.id)).toEqual(["m-01", "m-02"]);
+    expect(olderBatch[0].createdAt).toEqual(t1);
+    expect(olderBatch[1].createdAt).toEqual(t2);
+
+    // Prepending olderBatch before initialBatch gives full history [m1, m2, m3, m4, m5] without overlap
+    const fullStream = [...olderBatch, ...initialBatch];
+    expect(fullStream.map((m) => m.id)).toEqual(["m-01", "m-02", "m-03", "m-04", "m-05"]);
+
+    // End-of-history query: cursor = oldest from olderBatch ("m-01") -> returns empty array
+    vi.spyOn(prisma.conversation, "findUnique").mockResolvedValueOnce({ user1Id, user2Id } as any);
+    findManySpy.mockResolvedValueOnce([] as any);
+
+    const emptyBatch = await chatService.getConversationMessages(user1Id, conversationId, 3, "m-01");
+    expect(emptyBatch).toEqual([]);
   });
 });
 

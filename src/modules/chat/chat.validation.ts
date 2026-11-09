@@ -78,6 +78,7 @@ export const sendMessageSchema = z.object({
     .trim()
     .min(1, "Message content cannot be empty")
     .max(5000, "Message content cannot exceed 5000 characters"),
+  clientMutationId: z.string().uuid("Invalid clientMutationId UUID format").optional(),
 });
 
 /**

@@ -26,6 +26,14 @@ app.use(helmet());
 const allowedCorsOrigins = parseCorsOrigins(env.CORS_ORIGIN);
 const corsOriginResolver = createCorsOriginResolver(allowedCorsOrigins);
 
+// Explicitly warn in production if wildcard or empty configuration results in fail-closed CORS
+if (env.NODE_ENV === "production" && allowedCorsOrigins.length === 0) {
+  logger.warn(
+    "CORS: No web origins configured for production (CORS_ORIGIN is empty or '*'). " +
+    "Requests with an Origin header will be rejected. Native mobile clients without an Origin header remain permitted."
+  );
+}
+
 // Strict fail-closed CORS configuration (SEC-02)
 app.use(
   cors({

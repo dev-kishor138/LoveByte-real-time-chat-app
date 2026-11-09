@@ -113,7 +113,7 @@ export class ChatController {
         return;
       }
 
-      const { conversationId, content, type } = req.body;
+      const { conversationId, content, type, clientMutationId } = req.body;
       if (!conversationId) {
         res.status(400).json({
           error: "Validation failed",
@@ -131,6 +131,7 @@ export class ChatController {
         conversationId,
         content,
         type: type || "TEXT",
+        clientMutationId,
       });
       res.status(201).json(message);
     } catch (error) {

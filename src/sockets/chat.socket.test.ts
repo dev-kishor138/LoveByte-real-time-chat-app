@@ -625,11 +625,11 @@ describe("Chat Socket Handlers — Stage 3.3 Real-Time Message Event Handlers", 
     expect(recipientEmission?.rooms).toContain(`user:${user2Id}`);
     expect(recipientEmission?.excluded).toContain(`user:${user1Id}`);
 
-    // Verify sender's other devices notification
+    // Verify sender notification reaches all sockets of the user (including originating socket)
     const senderEmission = mockIO._emitted.find((e) => e.event === "message_sent");
     expect(senderEmission).toBeDefined();
     expect(senderEmission?.rooms).toContain(`user:${user1Id}`);
-    expect(senderEmission?.excluded).toContain(socket.id);
+    expect(senderEmission?.excluded).toEqual([]);
   });
 
   // 2. Non-participant cannot send
@@ -944,8 +944,8 @@ describe("Chat Socket Handlers — Stage 3.3 Real-Time Message Event Handlers", 
     expect(newMessageEmissions[0].excluded).toEqual([`user:${user1Id}`]);
   });
 
-  // 12. Sender's secondary device receives exactly one message_sent
-  it("12. Sender's secondary device receives exactly one message_sent (initiating socket excluded)", async () => {
+  // 12. Sender's devices receive message_sent (including originating socket for timeout reconciliation)
+  it("12. Sender's devices receive message_sent (including originating socket)", async () => {
     const socket = createMockSocket(user1Id);
     registerChatSocketHandlers(socket);
 
@@ -977,7 +977,7 @@ describe("Chat Socket Handlers — Stage 3.3 Real-Time Message Event Handlers", 
     const messageSentEmissions = mockIO._emitted.filter((e) => e.event === "message_sent");
     expect(messageSentEmissions.length).toBe(1);
     expect(messageSentEmissions[0].rooms).toEqual([`user:${user1Id}`]);
-    expect(messageSentEmissions[0].excluded).toEqual([socket.id]);
+    expect(messageSentEmissions[0].excluded).toEqual([]);
   });
 
   // === PART 2: edit_message ===

@@ -154,6 +154,48 @@ export function registerSignalHandlers(): void {
   });
 }
 
+/**
+ * Registers global process error handlers (uncaughtException, unhandledRejection).
+ * Logs the error safely, executes bounded emergency shutdown, and terminates with non-zero exit code.
+ * Ensures the application never continues serving requests in an undefined, corrupted runtime state.
+ * Executed only in the main entry point to avoid polluting test environments.
+ */
+export function registerProcessErrorHandlers(): void {
+  process.on("uncaughtException", async (error: Error) => {
+    logger.error("FATAL: Uncaught exception encountered; initiating emergency shutdown", {
+      error: error.message,
+      stack: error.stack,
+    });
+    try {
+      await gracefulShutdown({ timeoutMs: 5_000 });
+    } catch (shutdownErr) {
+      logger.error("Error during emergency shutdown after uncaughtException", {
+        error: shutdownErr,
+      });
+    } finally {
+      process.exit(1);
+    }
+  });
+
+  process.on("unhandledRejection", async (reason: unknown) => {
+    const message = reason instanceof Error ? reason.message : String(reason);
+    const stack = reason instanceof Error ? reason.stack : undefined;
+    logger.error("FATAL: Unhandled promise rejection encountered; initiating emergency shutdown", {
+      error: message,
+      stack,
+    });
+    try {
+      await gracefulShutdown({ timeoutMs: 5_000 });
+    } catch (shutdownErr) {
+      logger.error("Error during emergency shutdown after unhandledRejection", {
+        error: shutdownErr,
+      });
+    } finally {
+      process.exit(1);
+    }
+  });
+}
+
 // Start listening and register process signal handlers only when executed directly (not in unit test runner)
 if (process.env.NODE_ENV !== "test") {
   server.listen(env.PORT, () => {
@@ -161,5 +203,6 @@ if (process.env.NODE_ENV !== "test") {
   });
 
   registerSignalHandlers();
+  registerProcessErrorHandlers();
 }
 

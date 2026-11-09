@@ -59,6 +59,8 @@ export function parseCorsOrigins(
 
   // Exclusive wildcard check: permitted ONLY when the trimmed config is exactly "*"
   if (trimmed === "*") {
+    // In production, wildcard '*' is disallowed to prevent CSRF and cross-origin credential exposure.
+    // Fails closed by returning [] (rejecting browser requests with an Origin header).
     return isProduction ? [] : "*";
   }
 

@@ -5,15 +5,27 @@ import { defineConfig } from "prisma/config";
 
 // For Prisma migrations on Neon PostgreSQL, use direct unpooled connection
 // to avoid PgBouncer transaction-pooling advisory lock hangs.
-// Fail safely if DIRECT_URL is missing; silent fallback to pooled DATABASE_URL is disabled.
+// Fail safely if DIRECT_URL is missing during schema migration operations; silent fallback to pooled DATABASE_URL is disabled.
+const isMigrationCommand = process.argv.some(
+  (arg) => arg.includes("migrate") || arg.includes("db")
+);
+
 const directUrl = process.env["DIRECT_URL"];
 
-if (!directUrl) {
+if (isMigrationCommand && !directUrl) {
   throw new Error(
     "FATAL CONFIGURATION ERROR: DIRECT_URL is required for Prisma migrations on Neon PostgreSQL.\n" +
     "Silent fallback to pooled DATABASE_URL is disabled to prevent advisory-lock deadlocks."
   );
 }
+
+// When generating client code without migrations (e.g. prisma generate during clean builds),
+// use directUrl if present, otherwise fallback to DATABASE_URL or dummy placeholder.
+// Note: Client code generation does not establish any network connection to this URL.
+const datasourceUrl =
+  directUrl ||
+  process.env["DATABASE_URL"] ||
+  "postgresql://placeholder:placeholder@localhost:5432/placeholder";
 
 export default defineConfig({
   schema: "prisma/schema.prisma",
@@ -21,6 +33,6 @@ export default defineConfig({
     path: "prisma/migrations",
   },
   datasource: {
-    url: directUrl,
+    url: datasourceUrl,
   },
 });
