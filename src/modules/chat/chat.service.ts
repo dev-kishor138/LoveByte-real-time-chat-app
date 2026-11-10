@@ -210,6 +210,7 @@ export class ChatService {
         id: true,
         conversationId: true,
         senderId: true,
+        clientMutationId: true,
         type: true,
         content: true,
         fileKey: true,
@@ -234,6 +235,7 @@ export class ChatService {
       id: msg.id,
       conversationId: msg.conversationId,
       senderId: msg.senderId,
+      ...(msg.clientMutationId ? { clientMutationId: msg.clientMutationId } : {}),
       type: msg.type,
       content: msg.isDeleted ? null : msg.content,
       fileKey: msg.isDeleted ? null : msg.fileKey,
@@ -285,42 +287,98 @@ export class ChatService {
       throw error;
     }
 
-    const message = await prisma.$transaction(async (tx) => {
-      const created = await tx.message.create({
-        data: {
-          conversationId,
-          senderId,
-          type: "TEXT",
-          content: input.content.trim(),
-          fileKey: null,
-          fileMime: null,
-          fileSize: null,
-        },
-        select: {
-          id: true,
-          conversationId: true,
-          senderId: true,
-          type: true,
-          content: true,
-          fileKey: true,
-          fileMime: true,
-          fileSize: true,
-          isEdited: true,
-          editedAt: true,
-          isDeleted: true,
-          createdAt: true,
-          updatedAt: true,
-        },
-      });
+    const trimmedContent = input.content.trim();
+    let message: any;
+    let isDuplicate = false;
 
-      // Update conversation timestamp
-      await tx.conversation.update({
-        where: { id: conversationId },
-        data: { updatedAt: new Date() },
-      });
+    try {
+      message = await prisma.$transaction(async (tx) => {
+        const created = await tx.message.create({
+          data: {
+            conversationId,
+            senderId,
+            clientMutationId: input.clientMutationId || null,
+            type: "TEXT",
+            content: trimmedContent,
+            fileKey: null,
+            fileMime: null,
+            fileSize: null,
+          },
+          select: {
+            id: true,
+            conversationId: true,
+            senderId: true,
+            clientMutationId: true,
+            type: true,
+            content: true,
+            fileKey: true,
+            fileMime: true,
+            fileSize: true,
+            isEdited: true,
+            editedAt: true,
+            isDeleted: true,
+            createdAt: true,
+            updatedAt: true,
+          },
+        });
 
-      return created;
-    });
+        // Update conversation timestamp
+        await tx.conversation.update({
+          where: { id: conversationId },
+          data: { updatedAt: new Date() },
+        });
+
+        return created;
+      });
+    } catch (err: any) {
+      if (err?.code === "P2002" && input.clientMutationId) {
+        // Unique constraint violation on (conversationId, senderId, clientMutationId).
+        // Atomically query the existing record to verify idempotency vs conflict.
+        const existing = await prisma.message.findFirst({
+          where: {
+            conversationId,
+            senderId,
+            clientMutationId: input.clientMutationId,
+          },
+          select: {
+            id: true,
+            conversationId: true,
+            senderId: true,
+            clientMutationId: true,
+            type: true,
+            content: true,
+            fileKey: true,
+            fileMime: true,
+            fileSize: true,
+            isEdited: true,
+            editedAt: true,
+            isDeleted: true,
+            createdAt: true,
+            updatedAt: true,
+          },
+        });
+
+        if (existing) {
+          const expectedType = input.type || "TEXT";
+          if (existing.content === trimmedContent && existing.type === expectedType) {
+            // Idempotent duplicate replay: same key + same payload
+            isDuplicate = true;
+            message = existing;
+          } else {
+            // Idempotency conflict: same key + different payload
+            const conflictError = new Error(
+              "Idempotency conflict: clientMutationId has already been used with different content or payload"
+            );
+            (conflictError as any).statusCode = 409;
+            throw conflictError;
+          }
+        } else {
+          throw err;
+        }
+      } else {
+        throw err;
+      }
+    }
 
     // Real-time broadcast to recipient room and sender room via Socket.IO
     const recipientId = conversation.user1Id === senderId ? conversation.user2Id : conversation.user1Id;
@@ -328,11 +386,13 @@ export class ChatService {
       const io = getIO();
       // 1. Deliver to recipient (whether in conversation room or personal room) exactly once.
       // Exclude sender's user room so the sender does not receive new_message for their own message.
-      // Strictly do not include clientMutationId in recipient's new_message payload.
-      io.to(`conversation:${conversationId}`)
-        .to(`user:${recipientId}`)
-        .except(`user:${senderId}`)
-        .emit("new_message", message);
+      // Strictly do not emit duplicate new_message on idempotent replay.
+      if (!isDuplicate) {
+        io.to(`conversation:${conversationId}`)
+          .to(`user:${recipientId}`)
+          .except(`user:${senderId}`)
+          .emit("new_message", message);
+      }
 
       // 2. Deliver confirmation to all connected devices in sender's personal room.
       // Broadcast message_sent to user:${senderId} (including originating socket)
@@ -350,6 +410,7 @@ export class ChatService {
     return {
       ...message,
       ...(input.clientMutationId ? { clientMutationId: input.clientMutationId } : {}),
+      ...(isDuplicate ? { _isDuplicate: true } : {}),
     };
   }
 

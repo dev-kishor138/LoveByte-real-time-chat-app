@@ -907,6 +907,82 @@ describe("Chat Socket Handlers — Stage 3.3 Real-Time Message Event Handlers", 
     expect(socket.emit).not.toHaveBeenCalledWith("message_sent", expect.anything());
   });
 
+  // 10b. Idempotent replay returns clean message without leaking _isDuplicate
+  it("10b. Idempotent duplicate replay returns clean message to ack callback without _isDuplicate flag", async () => {
+    const socket = createMockSocket(user1Id);
+    registerChatSocketHandlers(socket);
+
+    const mutationId = "123e4567-e89b-12d3-a456-426614174000";
+    vi.spyOn(chatService, "sendMessage").mockResolvedValueOnce({
+      id: "existing-msg-dup",
+      conversationId: validConversationId,
+      senderId: user1Id,
+      clientMutationId: mutationId,
+      type: "TEXT",
+      content: "Duplicate content",
+      isEdited: false,
+      isDeleted: false,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      _isDuplicate: true,
+    } as any);
+
+    const ack = vi.fn();
+    socket.emit(
+      "send_message",
+      {
+        conversationId: validConversationId,
+        content: "Duplicate content",
+        clientMutationId: mutationId,
+      },
+      ack
+    );
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(ack).toHaveBeenCalledWith({
+      success: true,
+      message: expect.objectContaining({
+        id: "existing-msg-dup",
+        clientMutationId: mutationId,
+      }),
+    });
+    const ackArg = ack.mock.calls[0][0];
+    expect(ackArg.message._isDuplicate).toBeUndefined();
+  });
+
+  // 10c. 409 Conflict returns error message in ack and emits error
+  it("10c. Returns 409 conflict error to ack callback and emits error when clientMutationId reused with different payload", async () => {
+    const socket = createMockSocket(user1Id);
+    registerChatSocketHandlers(socket);
+
+    const conflictErr: any = new Error(
+      "Idempotency conflict: clientMutationId has already been used with different content or payload"
+    );
+    conflictErr.statusCode = 409;
+    vi.spyOn(chatService, "sendMessage").mockRejectedValueOnce(conflictErr);
+
+    const ack = vi.fn();
+    socket.emit(
+      "send_message",
+      {
+        conversationId: validConversationId,
+        content: "Different content",
+        clientMutationId: "123e4567-e89b-12d3-a456-426614174000",
+      },
+      ack
+    );
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(ack).toHaveBeenCalledWith({
+      success: false,
+      error: expect.stringContaining("Idempotency conflict"),
+    });
+    expect(socket.emit).toHaveBeenCalledWith("error", {
+      event: "send_message",
+      error: expect.stringContaining("Idempotency conflict"),
+    });
+  });
+
   // 11. Recipient in both user and conversation rooms receives exactly one notification
   it("11. Recipient in both user and conversation rooms receives exactly one notification via chained union", async () => {
     const socket = createMockSocket(user1Id);

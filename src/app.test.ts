@@ -1,10 +1,17 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import request from "supertest";
-import { app, resetHealthCheckCache } from "./app";
+import {
+  app,
+  resetHealthCheckCache,
+  setHealthCheckTimeoutForTesting,
+  DEFAULT_HEALTH_CHECK_TIMEOUT_MS,
+  HEALTH_CHECK_ERROR_CACHE_TTL_MS,
+} from "./app";
 import { prisma } from "./config/prisma";
+import { warmUpDatabase } from "./server";
 import * as shutdownModule from "./utils/shutdown";
 
-describe("Application Health Check (Stage A)", () => {
+describe("Application Health Check & Neon Database Recovery (Stage 1)", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
     resetHealthCheckCache();
@@ -62,15 +69,115 @@ describe("Application Health Check (Stage A)", () => {
     expect(clearTimeoutSpy).toHaveBeenCalled();
   });
 
-  it("6. Rejects and returns 503 when database query exceeds 2-second timeout", { timeout: 5000 }, async () => {
+  it("6. Rejects and returns 503 when database query exceeds timeout", async () => {
+    setHealthCheckTimeoutForTesting(100);
     vi.spyOn(prisma, "$queryRaw").mockImplementation(
-      () => new Promise((resolve) => setTimeout(resolve, 2500))
+      () => new Promise((resolve) => setTimeout(resolve, 300))
     );
 
     const res = await request(app).get("/health");
     expect(res.status).toBe(503);
     expect(res.body).toHaveProperty("status", "unhealthy");
     expect(res.body).toHaveProperty("error", "Database unavailable");
+  });
+
+  it("7. Coalesces concurrent in-flight requests into a single database query (single-flight)", async () => {
+    const querySpy = vi.spyOn(prisma, "$queryRaw").mockImplementation(
+      () => new Promise((resolve) => setTimeout(() => resolve([{ 1: 1 }] as any), 80))
+    );
+
+    // Dispatch 5 concurrent health check requests simultaneously
+    const responses = await Promise.all([
+      request(app).get("/health"),
+      request(app).get("/health"),
+      request(app).get("/health"),
+      request(app).get("/health"),
+      request(app).get("/health"),
+    ]);
+
+    for (const res of responses) {
+      expect(res.status).toBe(200);
+      expect(res.body.status).toBe("ok");
+      expect(res.body.database).toBe("connected");
+    }
+
+    // Single-flight ensures only 1 database query was initiated across all 5 requests
+    expect(querySpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("8. Recovers after failure and does not leave application in permanent 503", async () => {
+    const querySpy = vi
+      .spyOn(prisma, "$queryRaw")
+      .mockRejectedValueOnce(new Error("Neon waking up"))
+      .mockResolvedValueOnce([{ 1: 1 }] as any);
+
+    const res1 = await request(app).get("/health");
+    expect(res1.status).toBe(503);
+    expect(res1.body.status).toBe("unhealthy");
+
+    // Fast-forward past error cache TTL (HEALTH_CHECK_ERROR_CACHE_TTL_MS)
+    vi.spyOn(Date, "now").mockReturnValue(Date.now() + HEALTH_CHECK_ERROR_CACHE_TTL_MS + 50);
+
+    const res2 = await request(app).get("/health");
+    expect(res2.status).toBe(200);
+    expect(res2.body.status).toBe("ok");
+    expect(res2.body.database).toBe("connected");
+    expect(querySpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("9. Query promise late rejection after timeout does not cause unhandled rejection", async () => {
+    setHealthCheckTimeoutForTesting(50);
+    let triggerLateReject: ((err: Error) => void) | null = null;
+    vi.spyOn(prisma, "$queryRaw").mockImplementation(
+      () =>
+        new Promise((_, reject) => {
+          triggerLateReject = reject;
+        })
+    );
+
+    const res = await request(app).get("/health");
+    expect(res.status).toBe(503);
+    expect(res.body.status).toBe("unhealthy");
+
+    // Simulate late rejection occurring after timeout has already settled
+    expect(() => {
+      triggerLateReject?.(new Error("Late Neon connection failure"));
+    }).not.toThrow();
+  });
+
+  it("10. DEFAULT_HEALTH_CHECK_TIMEOUT_MS is configured to 5000ms", () => {
+    expect(DEFAULT_HEALTH_CHECK_TIMEOUT_MS).toBe(5000);
+  });
+});
+
+describe("Non-Blocking Database Warm-Up (Stage 1)", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    vi.spyOn(shutdownModule, "isShutdownInProgress").mockReturnValue(false);
+  });
+
+  it("1. Logs and succeeds when database query resolves cleanly", async () => {
+    const querySpy = vi.spyOn(prisma, "$queryRaw").mockResolvedValueOnce([{ 1: 1 }] as any);
+
+    await expect(warmUpDatabase()).resolves.toBeUndefined();
+    expect(querySpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("2. Catches database failure safely and does not throw or crash", async () => {
+    const querySpy = vi
+      .spyOn(prisma, "$queryRaw")
+      .mockRejectedValueOnce(new Error("Connection timeout during microVM wake-up"));
+
+    await expect(warmUpDatabase()).resolves.toBeUndefined();
+    expect(querySpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("3. Skips warm-up if shutdown is in progress", async () => {
+    vi.spyOn(shutdownModule, "isShutdownInProgress").mockReturnValue(true);
+    const querySpy = vi.spyOn(prisma, "$queryRaw").mockResolvedValueOnce([{ 1: 1 }] as any);
+
+    await warmUpDatabase();
+    expect(querySpy).not.toHaveBeenCalled();
   });
 });
 

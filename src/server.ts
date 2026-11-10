@@ -196,10 +196,32 @@ export function registerProcessErrorHandlers(): void {
   });
 }
 
+/**
+ * Asynchronously pings the database to trigger Neon serverless compute wake-up.
+ * Non-blocking: executed in the background after server.listen() without stalling HTTP traffic.
+ * Non-fatal: failures are safely logged and will be retried on-demand during subsequent requests.
+ */
+export async function warmUpDatabase(): Promise<void> {
+  if (isShutdownInProgress()) {
+    return;
+  }
+  try {
+    logger.info("Initiating non-blocking database warm-up ping...");
+    await prisma.$queryRaw`SELECT 1`;
+    logger.info("Database warm-up ping completed successfully");
+  } catch (err: any) {
+    logger.warn("Non-blocking database warm-up ping failed (will recover on demand)", {
+      error: err?.message,
+    });
+  }
+}
+
 // Start listening and register process signal handlers only when executed directly (not in unit test runner)
 if (process.env.NODE_ENV !== "test") {
   server.listen(env.PORT, () => {
     logger.info(`Server running on port ${env.PORT} in ${env.NODE_ENV} mode`);
+    // Non-blocking database warm-up after socket binds to port
+    warmUpDatabase().catch(() => {});
   });
 
   registerSignalHandlers();

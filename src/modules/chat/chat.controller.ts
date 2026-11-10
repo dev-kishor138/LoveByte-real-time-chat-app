@@ -127,13 +127,16 @@ export class ChatController {
         return;
       }
 
-      const message = await chatService.sendMessage(userId, conversationId, {
+      const result = await chatService.sendMessage(userId, conversationId, {
         conversationId,
         content,
         type: type || "TEXT",
         clientMutationId,
       });
-      res.status(201).json(message);
+
+      const isDuplicate = (result as any)._isDuplicate === true;
+      const { _isDuplicate, ...messagePayload } = result as any;
+      res.status(isDuplicate ? 200 : 201).json(messagePayload);
     } catch (error) {
       next(error);
     }

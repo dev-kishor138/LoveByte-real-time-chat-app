@@ -51,10 +51,36 @@ app.use(express.urlencoded({ extended: true, limit: "1mb" }));
 // General Rate Limiting
 app.use(apiRateLimiter);
 
-// Health check state cache to prevent connection pool exhaustion from unauthenticated spam
+// Health check configuration constants
+export const DEFAULT_HEALTH_CHECK_TIMEOUT_MS = 5000;
+export const HEALTH_CHECK_CACHE_TTL_MS = 2000;
+export const HEALTH_CHECK_ERROR_CACHE_TTL_MS = 1000;
+
+export let healthCheckTimeoutMs = DEFAULT_HEALTH_CHECK_TIMEOUT_MS;
+
+export function setHealthCheckTimeoutForTesting(ms: number): void {
+  healthCheckTimeoutMs = ms;
+}
+
+export function resetHealthCheckTimeoutForTesting(): void {
+  healthCheckTimeoutMs = DEFAULT_HEALTH_CHECK_TIMEOUT_MS;
+}
+
+interface HealthCheckResult {
+  status: number;
+  body: {
+    status: string;
+    database?: string;
+    timestamp: string;
+    error?: string;
+  };
+}
+
+// In-flight query promise to coalesce concurrent health checks (single-flight pattern)
+let activeHealthCheckPromise: Promise<HealthCheckResult> | null = null;
 let lastHealthCheckTime = 0;
 let lastHealthCheckStatus = 200;
-let lastHealthCheckBody: { status: string; database?: string; timestamp: string; error?: string } = {
+let lastHealthCheckBody: HealthCheckResult["body"] = {
   status: "ok",
   database: "connected",
   timestamp: new Date().toISOString(),
@@ -63,6 +89,8 @@ let lastHealthCheckBody: { status: string; database?: string; timestamp: string;
 export function resetHealthCheckCache(): void {
   lastHealthCheckTime = 0;
   lastHealthCheckStatus = 200;
+  activeHealthCheckPromise = null;
+  healthCheckTimeoutMs = DEFAULT_HEALTH_CHECK_TIMEOUT_MS;
 }
 
 // Enhanced health check endpoint verifying database connectivity
@@ -75,48 +103,72 @@ app.get("/health", async (_req, res) => {
   }
 
   const now = Date.now();
-  if (now - lastHealthCheckTime < 2000) {
+  const ttl =
+    lastHealthCheckStatus === 200
+      ? HEALTH_CHECK_CACHE_TTL_MS
+      : HEALTH_CHECK_ERROR_CACHE_TTL_MS;
+
+  if (now - lastHealthCheckTime < ttl) {
     return res.status(lastHealthCheckStatus).json(lastHealthCheckBody);
   }
 
-  let timeoutHandle: NodeJS.Timeout | undefined;
-  try {
-    const timeoutPromise = new Promise((_, reject) => {
-      timeoutHandle = setTimeout(() => reject(new Error("Health check query timeout")), 2000);
-      timeoutHandle.unref();
-    });
-
-    try {
-      // 2-second timeout guard for database ping
-      await Promise.race([
-        prisma.$queryRaw`SELECT 1`,
-        timeoutPromise,
-      ]);
-    } finally {
-      if (timeoutHandle) {
-        clearTimeout(timeoutHandle);
-      }
-    }
-
-    lastHealthCheckTime = now;
-    lastHealthCheckStatus = 200;
-    lastHealthCheckBody = {
-      status: "ok",
-      database: "connected",
-      timestamp: new Date().toISOString(),
-    };
-    return res.status(200).json(lastHealthCheckBody);
-  } catch (err: any) {
-    lastHealthCheckTime = now;
-    lastHealthCheckStatus = 503;
-    lastHealthCheckBody = {
-      status: "unhealthy",
-      error: "Database unavailable",
-      timestamp: new Date().toISOString(),
-    };
-    logger.warn("Health check failed", { error: err?.message });
-    return res.status(503).json(lastHealthCheckBody);
+  if (activeHealthCheckPromise) {
+    const inFlightResult = await activeHealthCheckPromise;
+    return res.status(inFlightResult.status).json(inFlightResult.body);
   }
+
+  activeHealthCheckPromise = (async (): Promise<HealthCheckResult> => {
+    let timeoutHandle: NodeJS.Timeout | undefined;
+    try {
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        timeoutHandle = setTimeout(
+          () => reject(new Error("Health check query timeout")),
+          healthCheckTimeoutMs
+        );
+        timeoutHandle.unref();
+      });
+
+      const queryPromise = prisma.$queryRaw`SELECT 1`;
+      // Safeguard: absorb late rejection if query outlives timeoutPromise
+      queryPromise.catch(() => {});
+
+      try {
+        await Promise.race([queryPromise, timeoutPromise]);
+      } finally {
+        if (timeoutHandle) {
+          clearTimeout(timeoutHandle);
+        }
+      }
+
+      const completedTime = Date.now();
+      const body = {
+        status: "ok",
+        database: "connected",
+        timestamp: new Date(completedTime).toISOString(),
+      };
+      lastHealthCheckTime = completedTime;
+      lastHealthCheckStatus = 200;
+      lastHealthCheckBody = body;
+      return { status: 200, body };
+    } catch (err: any) {
+      const completedTime = Date.now();
+      const body = {
+        status: "unhealthy",
+        error: "Database unavailable",
+        timestamp: new Date(completedTime).toISOString(),
+      };
+      lastHealthCheckTime = completedTime;
+      lastHealthCheckStatus = 503;
+      lastHealthCheckBody = body;
+      logger.warn("Health check failed", { error: err?.message });
+      return { status: 503, body };
+    } finally {
+      activeHealthCheckPromise = null;
+    }
+  })();
+
+  const result = await activeHealthCheckPromise;
+  return res.status(result.status).json(result.body);
 });
 
 // Authentication module routes

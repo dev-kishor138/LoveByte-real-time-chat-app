@@ -282,9 +282,11 @@ export function registerChatSocketHandlers(socket: AuthenticatedSocket): void {
           socket.id
         );
 
+        const { _isDuplicate, ...cleanMessage } = message as any;
+
         // Initiating socket receives primary acknowledgement only (no duplicate outbound event)
         if (typeof callback === "function") {
-          callback({ success: true, message });
+          callback({ success: true, message: cleanMessage });
         }
       } catch (err: any) {
         const statusCode = err?.statusCode;
@@ -292,7 +294,7 @@ export function registerChatSocketHandlers(socket: AuthenticatedSocket): void {
 
         if (statusCode === 403 || statusCode === 404) {
           errorMsg = "Access denied to this conversation";
-        } else if (statusCode === 400) {
+        } else if (statusCode === 400 || statusCode === 409) {
           errorMsg = err.message || "Invalid message request";
         }
 

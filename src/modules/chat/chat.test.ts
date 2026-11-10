@@ -1271,3 +1271,494 @@ describe("Chat Module - Read Receipts & Unread Counts (Stage A)", () => {
   });
 });
 
+// Stage 5: Persistent Message Idempotency & Safe Recovery
+describe("Chat Module - Stage 5 Idempotency & Safe Recovery", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    vi.spyOn(prisma, "$transaction").mockImplementation(async (callback: any) => {
+      if (typeof callback === "function") {
+        return callback(prisma);
+      }
+      if (Array.isArray(callback)) {
+        return Promise.all(callback);
+      }
+      return callback;
+    });
+  });
+
+  const conversationId = "c1f2e3d4-b5a6-4c7d-8e9f-0a1b2c3d4e5f";
+  const user1Id = "c1f2e3d4-b5a6-4c7d-8e9f-0a1b2c3d4e51";
+  const user2Id = "c1f2e3d4-b5a6-4c7d-8e9f-0a1b2c3d4e52";
+  const outsiderId = "c1f2e3d4-b5a6-4c7d-8e9f-0a1b2c3d4e99";
+  const mutationId1 = "123e4567-e89b-12d3-a456-426614174001";
+  const mutationId2 = "123e4567-e89b-12d3-a456-426614174002";
+
+    it("35. Persists clientMutationId in database when provided", async () => {
+      vi.spyOn(prisma.conversation, "findUnique").mockResolvedValueOnce({
+        user1Id,
+        user2Id,
+      } as any);
+
+      const mockCreated = {
+        id: "msg-idempotent-1",
+        conversationId,
+        senderId: user1Id,
+        clientMutationId: mutationId1,
+        type: "TEXT",
+        content: "Idempotent text",
+        fileKey: null,
+        fileMime: null,
+        fileSize: null,
+        isEdited: false,
+        editedAt: null,
+        isDeleted: false,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+
+      const createSpy = vi.spyOn(prisma.message, "create").mockResolvedValueOnce(mockCreated as any);
+      vi.spyOn(prisma.conversation, "update").mockResolvedValueOnce({} as any);
+
+      const result = await chatService.sendMessage(user1Id, conversationId, {
+        content: "Idempotent text",
+        type: "TEXT",
+        clientMutationId: mutationId1,
+      });
+
+      expect(result.id).toBe("msg-idempotent-1");
+      expect((result as any).clientMutationId).toBe(mutationId1);
+      expect((result as any)._isDuplicate).toBeUndefined();
+      expect(createSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            conversationId,
+            senderId: user1Id,
+            clientMutationId: mutationId1,
+            content: "Idempotent text",
+          }),
+        })
+      );
+    });
+
+    it("36. Idempotent retry with identical payload returns existing message without duplicate persistence", async () => {
+      vi.spyOn(prisma.conversation, "findUnique").mockResolvedValueOnce({
+        user1Id,
+        user2Id,
+      } as any);
+
+      const p2002Error: any = new Error("Unique constraint failed on the fields: (conversationId, senderId, clientMutationId)");
+      p2002Error.code = "P2002";
+
+      vi.spyOn(prisma.message, "create").mockRejectedValueOnce(p2002Error);
+
+      const existingMessage = {
+        id: "existing-msg-id",
+        conversationId,
+        senderId: user1Id,
+        clientMutationId: mutationId1,
+        type: "TEXT",
+        content: "Original message",
+        fileKey: null,
+        fileMime: null,
+        fileSize: null,
+        isEdited: false,
+        editedAt: null,
+        isDeleted: false,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+
+      const findFirstSpy = vi.spyOn(prisma.message, "findFirst").mockResolvedValueOnce(existingMessage as any);
+
+      const result = await chatService.sendMessage(user1Id, conversationId, {
+        content: "Original message",
+        type: "TEXT",
+        clientMutationId: mutationId1,
+      });
+
+      expect(result.id).toBe("existing-msg-id");
+      expect((result as any).clientMutationId).toBe(mutationId1);
+      expect((result as any)._isDuplicate).toBe(true);
+      expect(findFirstSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: {
+            conversationId,
+            senderId: user1Id,
+            clientMutationId: mutationId1,
+          },
+        })
+      );
+    });
+
+    it("37. Suppresses recipient-facing new_message socket event on duplicate replay while emitting message_sent to sender", async () => {
+      vi.spyOn(prisma.conversation, "findUnique").mockResolvedValueOnce({
+        user1Id,
+        user2Id,
+      } as any);
+
+      const p2002Error: any = new Error("Unique constraint failed");
+      p2002Error.code = "P2002";
+
+      vi.spyOn(prisma.message, "create").mockRejectedValueOnce(p2002Error);
+
+      const existingMessage = {
+        id: "existing-msg-id-2",
+        conversationId,
+        senderId: user1Id,
+        clientMutationId: mutationId1,
+        type: "TEXT",
+        content: "Duplicate text",
+        fileKey: null,
+        fileMime: null,
+        fileSize: null,
+        isEdited: false,
+        editedAt: null,
+        isDeleted: false,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+
+      vi.spyOn(prisma.message, "findFirst").mockResolvedValueOnce(existingMessage as any);
+
+      const emittedEvents: Array<{ event: string; payload: any; rooms: string[]; excluded: string[] }> = [];
+      let currentRooms: string[] = [];
+      let currentExcluded: string[] = [];
+      const mockOperator: any = {
+        to: vi.fn((r: string) => {
+          currentRooms.push(r);
+          return mockOperator;
+        }),
+        except: vi.fn((r: string) => {
+          currentExcluded.push(r);
+          return mockOperator;
+        }),
+        emit: vi.fn((event: string, payload: any) => {
+          emittedEvents.push({
+            event,
+            payload,
+            rooms: [...currentRooms],
+            excluded: [...currentExcluded],
+          });
+          return true;
+        }),
+      };
+      const mockIO: any = {
+        to: vi.fn((r: string) => {
+          currentRooms = [r];
+          currentExcluded = [];
+          return mockOperator;
+        }),
+      };
+
+      vi.spyOn(sockets, "getIO").mockReturnValue(mockIO);
+
+      const result = await chatService.sendMessage(user1Id, conversationId, {
+        content: "Duplicate text",
+        type: "TEXT",
+        clientMutationId: mutationId1,
+      });
+
+      expect(result.id).toBe("existing-msg-id-2");
+      expect((result as any)._isDuplicate).toBe(true);
+
+      // Verify new_message was strictly suppressed
+      const newMsgEvent = emittedEvents.find((e) => e.event === "new_message");
+      expect(newMsgEvent).toBeUndefined();
+
+      // Verify message_sent was still emitted to sender room with clientMutationId
+      const sentEvent = emittedEvents.find((e) => e.event === "message_sent");
+      expect(sentEvent).toBeDefined();
+      expect(sentEvent?.rooms).toContain(`user:${user1Id}`);
+      expect(sentEvent?.payload.clientMutationId).toBe(mutationId1);
+    });
+
+    it("38. Rejects key reuse with different content with HTTP 409 Conflict", async () => {
+      vi.spyOn(prisma.conversation, "findUnique").mockResolvedValueOnce({
+        user1Id,
+        user2Id,
+      } as any);
+
+      const p2002Error: any = new Error("Unique constraint failed");
+      p2002Error.code = "P2002";
+
+      vi.spyOn(prisma.message, "create").mockRejectedValueOnce(p2002Error);
+
+      const existingMessage = {
+        id: "existing-msg-id-3",
+        conversationId,
+        senderId: user1Id,
+        clientMutationId: mutationId1,
+        type: "TEXT",
+        content: "First content version",
+        fileKey: null,
+        fileMime: null,
+        fileSize: null,
+        isEdited: false,
+        editedAt: null,
+        isDeleted: false,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+
+      vi.spyOn(prisma.message, "findFirst").mockResolvedValueOnce(existingMessage as any);
+
+      await expect(
+        chatService.sendMessage(user1Id, conversationId, {
+          content: "Second completely different content",
+          type: "TEXT",
+          clientMutationId: mutationId1,
+        })
+      ).rejects.toMatchObject({
+        statusCode: 409,
+        message: expect.stringContaining("Idempotency conflict"),
+      });
+    });
+
+    it("39. Concurrent duplicate requests result in exactly one persisted message and zero duplicate broadcasts", async () => {
+      vi.spyOn(prisma.conversation, "findUnique").mockResolvedValue({
+        user1Id,
+        user2Id,
+      } as any);
+
+      const persistedMessage = {
+        id: "concurrent-msg-1",
+        conversationId,
+        senderId: user1Id,
+        clientMutationId: mutationId2,
+        type: "TEXT",
+        content: "Concurrent test message",
+        fileKey: null,
+        fileMime: null,
+        fileSize: null,
+        isEdited: false,
+        editedAt: null,
+        isDeleted: false,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+
+      const p2002Error: any = new Error("Unique constraint failed");
+      p2002Error.code = "P2002";
+
+      // First call succeeds in creation, second call hits P2002 collision
+      vi.spyOn(prisma.message, "create")
+        .mockResolvedValueOnce(persistedMessage as any)
+        .mockRejectedValueOnce(p2002Error);
+
+      vi.spyOn(prisma.conversation, "update").mockResolvedValue({} as any);
+      vi.spyOn(prisma.message, "findFirst").mockResolvedValueOnce(persistedMessage as any);
+
+      const emittedEvents: Array<{ event: string; payload: any }> = [];
+      const mockOperator: any = {
+        to: vi.fn(() => mockOperator),
+        except: vi.fn(() => mockOperator),
+        emit: vi.fn((event: string, payload: any) => {
+          emittedEvents.push({ event, payload });
+          return true;
+        }),
+      };
+      const mockIO: any = {
+        to: vi.fn(() => mockOperator),
+      };
+      vi.spyOn(sockets, "getIO").mockReturnValue(mockIO);
+
+      // Execute concurrently
+      const [res1, res2] = await Promise.all([
+        chatService.sendMessage(user1Id, conversationId, {
+          content: "Concurrent test message",
+          type: "TEXT",
+          clientMutationId: mutationId2,
+        }),
+        chatService.sendMessage(user1Id, conversationId, {
+          content: "Concurrent test message",
+          type: "TEXT",
+          clientMutationId: mutationId2,
+        }),
+      ]);
+
+      expect(res1.id).toBe("concurrent-msg-1");
+      expect(res2.id).toBe("concurrent-msg-1");
+      expect((res1 as any)._isDuplicate).toBeUndefined();
+      expect((res2 as any)._isDuplicate).toBe(true);
+
+      // Exactly ONE new_message broadcast was emitted to recipient across both concurrent calls
+      const newMsgBroadcasts = emittedEvents.filter((e) => e.event === "new_message");
+      expect(newMsgBroadcasts.length).toBe(1);
+    });
+
+    it("40. Allows different senders in same conversation to use same clientMutationId independently", async () => {
+      vi.spyOn(prisma.conversation, "findUnique").mockResolvedValue({
+        user1Id,
+        user2Id,
+      } as any);
+
+      const user1Message = {
+        id: "user1-msg",
+        conversationId,
+        senderId: user1Id,
+        clientMutationId: mutationId1,
+        type: "TEXT",
+        content: "User 1 message",
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+      const user2Message = {
+        id: "user2-msg",
+        conversationId,
+        senderId: user2Id,
+        clientMutationId: mutationId1,
+        type: "TEXT",
+        content: "User 2 message",
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+
+      const createSpy = vi.spyOn(prisma.message, "create")
+        .mockResolvedValueOnce(user1Message as any)
+        .mockResolvedValueOnce(user2Message as any);
+      vi.spyOn(prisma.conversation, "update").mockResolvedValue({} as any);
+
+      const res1 = await chatService.sendMessage(user1Id, conversationId, {
+        content: "User 1 message",
+        type: "TEXT",
+        clientMutationId: mutationId1,
+      });
+
+      const res2 = await chatService.sendMessage(user2Id, conversationId, {
+        content: "User 2 message",
+        type: "TEXT",
+        clientMutationId: mutationId1,
+      });
+
+      expect(res1.id).toBe("user1-msg");
+      expect(res2.id).toBe("user2-msg");
+      expect((res1 as any)._isDuplicate).toBeUndefined();
+      expect((res2 as any)._isDuplicate).toBeUndefined();
+      expect(createSpy).toHaveBeenCalledTimes(2);
+    });
+
+    it("41. Allows same sender to use same clientMutationId across different conversations independently", async () => {
+      const conv2Id = "00000000-0000-0000-0000-000000000099";
+      vi.spyOn(prisma.conversation, "findUnique")
+        .mockResolvedValueOnce({ user1Id, user2Id } as any)
+        .mockResolvedValueOnce({ user1Id, user2Id: outsiderId } as any);
+
+      const conv1Msg = {
+        id: "conv1-msg",
+        conversationId,
+        senderId: user1Id,
+        clientMutationId: mutationId1,
+        type: "TEXT",
+        content: "Chat 1",
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+      const conv2Msg = {
+        id: "conv2-msg",
+        conversationId: conv2Id,
+        senderId: user1Id,
+        clientMutationId: mutationId1,
+        type: "TEXT",
+        content: "Chat 2",
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+
+      const createSpy = vi.spyOn(prisma.message, "create")
+        .mockResolvedValueOnce(conv1Msg as any)
+        .mockResolvedValueOnce(conv2Msg as any);
+      vi.spyOn(prisma.conversation, "update").mockResolvedValue({} as any);
+
+      const res1 = await chatService.sendMessage(user1Id, conversationId, {
+        content: "Chat 1",
+        type: "TEXT",
+        clientMutationId: mutationId1,
+      });
+
+      const res2 = await chatService.sendMessage(user1Id, conv2Id, {
+        content: "Chat 2",
+        type: "TEXT",
+        clientMutationId: mutationId1,
+      });
+
+      expect(res1.id).toBe("conv1-msg");
+      expect(res2.id).toBe("conv2-msg");
+      expect(createSpy).toHaveBeenCalledTimes(2);
+    });
+
+    it("42. Rejects unauthorized outsider before any idempotency lookup", async () => {
+      vi.spyOn(prisma.conversation, "findUnique").mockResolvedValueOnce({
+        user1Id,
+        user2Id,
+      } as any);
+
+      const findFirstSpy = vi.spyOn(prisma.message, "findFirst");
+
+      await expect(
+        chatService.sendMessage(outsiderId, conversationId, {
+          content: "Outsider spy",
+          type: "TEXT",
+          clientMutationId: mutationId1,
+        })
+      ).rejects.toMatchObject({
+        statusCode: 403,
+      });
+
+      expect(findFirstSpy).not.toHaveBeenCalled();
+    });
+
+    it("43. getConversationMessages includes clientMutationId when present on message records", async () => {
+      vi.spyOn(prisma.conversation, "findUnique").mockResolvedValueOnce({
+        user1Id,
+        user2Id,
+      } as any);
+
+      const mockDbMessages = [
+        {
+          id: "m-with-mutation",
+          conversationId,
+          senderId: user1Id,
+          clientMutationId: mutationId1,
+          type: "TEXT",
+          content: "Has mutation ID",
+          fileKey: null,
+          fileMime: null,
+          fileSize: null,
+          isEdited: false,
+          editedAt: null,
+          isDeleted: false,
+          readAt: null,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        },
+        {
+          id: "m-legacy-null",
+          conversationId,
+          senderId: user1Id,
+          clientMutationId: null,
+          type: "TEXT",
+          content: "Legacy message without mutation ID",
+          fileKey: null,
+          fileMime: null,
+          fileSize: null,
+          isEdited: false,
+          editedAt: null,
+          isDeleted: false,
+          readAt: null,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        },
+      ];
+
+      vi.spyOn(prisma.message, "findMany").mockResolvedValueOnce(mockDbMessages as any);
+
+      const messages = await chatService.getConversationMessages(user1Id, conversationId, 10);
+      expect(messages.length).toBe(2);
+
+      const msgWithMutation = messages.find((m) => m.id === "m-with-mutation");
+      expect(msgWithMutation?.clientMutationId).toBe(mutationId1);
+
+      const legacyMsg = messages.find((m) => m.id === "m-legacy-null");
+      expect(legacyMsg?.clientMutationId).toBeUndefined();
+    });
+  });

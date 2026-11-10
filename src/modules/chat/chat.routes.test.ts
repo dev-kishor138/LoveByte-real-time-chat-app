@@ -459,6 +459,67 @@ describe("Chat Module - REST Controller & Route Layer (HTTP Integration)", () =>
         "Access denied: You are not a participant in this conversation"
       );
     });
+
+    it("returns 200 OK and message payload on idempotent replay with same clientMutationId", async () => {
+      const mockExisting = {
+        id: messageId,
+        conversationId,
+        senderId: testUser.userId,
+        type: "TEXT",
+        content: "Hello world!",
+        clientMutationId: "123e4567-e89b-12d3-a456-426614174000",
+        fileKey: null,
+        fileMime: null,
+        fileSize: null,
+        isEdited: false,
+        editedAt: null,
+        isDeleted: false,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        _isDuplicate: true,
+      };
+
+      vi.spyOn(chatService, "sendMessage").mockResolvedValueOnce(
+        mockExisting as any
+      );
+
+      const res = await request(app)
+        .post("/api/chat/messages")
+        .set("Authorization", authHeader)
+        .send({
+          conversationId,
+          content: "Hello world!",
+          type: "TEXT",
+          clientMutationId: "123e4567-e89b-12d3-a456-426614174000",
+        });
+
+      expect(res.status).toBe(200);
+      expect(res.body.id).toBe(messageId);
+      expect(res.body.clientMutationId).toBe("123e4567-e89b-12d3-a456-426614174000");
+      expect(res.body._isDuplicate).toBeUndefined();
+    });
+
+    it("returns 409 Conflict when clientMutationId is reused with different payload", async () => {
+      const conflictError: any = new Error(
+        "Idempotency conflict: clientMutationId has already been used with different content or payload"
+      );
+      conflictError.statusCode = 409;
+
+      vi.spyOn(chatService, "sendMessage").mockRejectedValueOnce(conflictError);
+
+      const res = await request(app)
+        .post("/api/chat/messages")
+        .set("Authorization", authHeader)
+        .send({
+          conversationId,
+          content: "Different content",
+          type: "TEXT",
+          clientMutationId: "123e4567-e89b-12d3-a456-426614174000",
+        });
+
+      expect(res.status).toBe(409);
+      expect(res.body.error).toContain("Idempotency conflict");
+    });
   });
 
   // 6. Edit message
