@@ -6,6 +6,14 @@
  */
 
 /**
+ * Default production origins explicitly approved for LoveByte deployments.
+ * Covers the live Render web service and client origins.
+ */
+export const DEFAULT_PRODUCTION_ORIGINS: readonly string[] = [
+  "https://lovebyte-real-time-chat-app.onrender.com",
+];
+
+/**
  * Validates that an origin string conforms to RFC 6454 serialized origin rules:
  * - Scheme must be http: or https:
  * - Hostname must be non-empty
@@ -41,9 +49,9 @@ export function isValidOrigin(originStr: string): boolean {
  * Parses raw CORS configuration string into an allowed origin array or exclusive development wildcard.
  *
  * Rules:
- * - Empty, missing, or whitespace-only -> []
- * - Exactly "*" (exclusive) -> "*" in development/test; [] in production
- * - Mixed wildcard (e.g. "https://app.com,*") -> []
+ * - Empty, missing, or whitespace-only -> in production returns DEFAULT_PRODUCTION_ORIGINS; in dev/test returns []
+ * - Exactly "*" (exclusive) -> "*" in development/test; [] in production (wildcards strictly rejected in prod)
+ * - Mixed wildcard (e.g. "https://app.com,*") -> [] (fails closed completely)
  * - Any malformed or credentialed candidate in a list -> [] (fails closed completely)
  * - Valid comma-separated origins -> array of normalized origins [scheme]://[host]:[port]
  */
@@ -52,7 +60,7 @@ export function parseCorsOrigins(
   isProduction: boolean = process.env.NODE_ENV === "production"
 ): string | string[] {
   if (!rawOrigin || typeof rawOrigin !== "string" || !rawOrigin.trim()) {
-    return [];
+    return isProduction ? [...DEFAULT_PRODUCTION_ORIGINS] : [];
   }
 
   const trimmed = rawOrigin.trim();
@@ -71,7 +79,7 @@ export function parseCorsOrigins(
     .filter((o) => o.length > 0);
 
   if (candidates.length === 0) {
-    return [];
+    return isProduction ? [...DEFAULT_PRODUCTION_ORIGINS] : [];
   }
 
   // Mixed wildcard rejection: wildcard is only valid if exclusively configured alone
@@ -94,6 +102,21 @@ export function parseCorsOrigins(
 
 /**
  * Creates an Express CORS origin resolver callback for use with the `cors` package.
+ *
+ * NATIVE CLIENT ORIGIN POLICY:
+ * Cross-Origin Resource Sharing (CORS) is a browser-enforced security mechanism designed to protect
+ * web users from cross-site request forgery and unauthorized data exfiltration.
+ *
+ * Native mobile clients (Android and iOS compiled via React Native / Expo / OkHttp) execute in an
+ * operating-system process rather than a browser sandbox and do not inherently send an `Origin` header.
+ * Therefore:
+ * 1. Requests lacking an `Origin` header are permitted through the origin gatekeeper.
+ * 2. Security for native clients is NOT compromised because origin gatekeeping is only the outer barrier;
+ *    EVERY native request strictly requires cryptographic authentication via a verified JWT bearer token.
+ * 3. Web browsers ALWAYS send an `Origin` header on cross-origin requests; thus, a browser attacker
+ *    cannot omit the `Origin` header to bypass CORS.
+ * 4. When native clients (or hybrid webviews) DO send an `Origin` header (such as the app host URL),
+ *    it is strictly evaluated against the allowed origins allowlist.
  */
 export function createCorsOriginResolver(
   allowedOrigins: string | string[]
@@ -132,6 +155,9 @@ export function createCorsOriginResolver(
 
 /**
  * Synchronous evaluator for Engine.IO `allowRequest` hook to validate incoming Origin.
+ *
+ * Enforces the identical Native Client Origin Policy as createCorsOriginResolver to guarantee
+ * complete parity between HTTP REST CORS and Socket.IO connection handshakes.
  */
 export function evaluateOrigin(
   origin: string | undefined,

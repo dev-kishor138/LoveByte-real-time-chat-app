@@ -4,6 +4,7 @@ import {
   parseCorsOrigins,
   createCorsOriginResolver,
   evaluateOrigin,
+  DEFAULT_PRODUCTION_ORIGINS,
 } from "./cors";
 
 describe("Fail-Closed CORS Configuration & Origin Validator (SEC-02)", () => {
@@ -12,6 +13,7 @@ describe("Fail-Closed CORS Configuration & Origin Validator (SEC-02)", () => {
       expect(isValidOrigin("http://localhost:3000")).toBe(true);
       expect(isValidOrigin("https://app.lovebyte.com")).toBe(true);
       expect(isValidOrigin("https://app.lovebyte.com/")).toBe(true);
+      expect(isValidOrigin("https://lovebyte-real-time-chat-app.onrender.com")).toBe(true);
     });
 
     it("rejects origins containing URL credentials (username/password)", () => {
@@ -46,10 +48,22 @@ describe("Fail-Closed CORS Configuration & Origin Validator (SEC-02)", () => {
   });
 
   describe("parseCorsOrigins", () => {
-    it("returns empty array for empty, undefined, or whitespace-only configuration", () => {
-      expect(parseCorsOrigins(undefined)).toEqual([]);
-      expect(parseCorsOrigins("")).toEqual([]);
-      expect(parseCorsOrigins("   ")).toEqual([]);
+    it("returns empty array for empty, undefined, or whitespace-only configuration in dev/test", () => {
+      expect(parseCorsOrigins(undefined, false)).toEqual([]);
+      expect(parseCorsOrigins("", false)).toEqual([]);
+      expect(parseCorsOrigins("   ", false)).toEqual([]);
+    });
+
+    it("falls back to explicit DEFAULT_PRODUCTION_ORIGINS in production when configuration is missing or empty", () => {
+      expect(parseCorsOrigins(undefined, true)).toEqual([
+        "https://lovebyte-real-time-chat-app.onrender.com",
+      ]);
+      expect(parseCorsOrigins("", true)).toEqual([
+        "https://lovebyte-real-time-chat-app.onrender.com",
+      ]);
+      expect(parseCorsOrigins("   ", true)).toEqual([
+        "https://lovebyte-real-time-chat-app.onrender.com",
+      ]);
     });
 
     it("accepts single valid origin and normalizes it", () => {
@@ -176,6 +190,24 @@ describe("Fail-Closed CORS Configuration & Origin Validator (SEC-02)", () => {
 
     it("returns false for empty allowed list (fail-closed)", () => {
       expect(evaluateOrigin("https://app.lovebyte.com", [])).toBe(false);
+    });
+
+    it("evaluates true for deployed production origin against DEFAULT_PRODUCTION_ORIGINS", () => {
+      expect(
+        evaluateOrigin(
+          "https://lovebyte-real-time-chat-app.onrender.com",
+          DEFAULT_PRODUCTION_ORIGINS as unknown as string[]
+        )
+      ).toBe(true);
+    });
+
+    it("evaluates false for unauthorized origin against DEFAULT_PRODUCTION_ORIGINS", () => {
+      expect(
+        evaluateOrigin(
+          "https://malicious-site.com",
+          DEFAULT_PRODUCTION_ORIGINS as unknown as string[]
+        )
+      ).toBe(false);
     });
   });
 });

@@ -163,6 +163,12 @@ export function initSocketIO(httpServer: HttpServer): Server {
   const allowedOrigins = parseCorsOrigins(env.CORS_ORIGIN);
   const corsOriginResolver = createCorsOriginResolver(allowedOrigins);
 
+  if (env.NODE_ENV === "production") {
+    logger.info("Socket.IO origin gatekeeper initialized", {
+      allowedOrigins: Array.isArray(allowedOrigins) ? allowedOrigins : [allowedOrigins],
+    });
+  }
+
   const io = new Server(httpServer, {
     cors: {
       origin: corsOriginResolver,
