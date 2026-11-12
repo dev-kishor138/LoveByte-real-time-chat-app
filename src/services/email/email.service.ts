@@ -14,15 +14,32 @@ export class EmailService {
   private transporter: Transporter | null = null;
   public sentEmailsForTesting: SentEmailRecord[] = [];
 
-  constructor() {
-    if (env.EMAIL_PROVIDER === "smtp" && env.SMTP_HOST && env.SMTP_USER && env.SMTP_PASS) {
+  constructor(options?: {
+    provider?: string;
+    host?: string;
+    port?: number;
+    secure?: boolean;
+    user?: string;
+    pass?: string;
+  }) {
+    const provider = options?.provider ?? env.EMAIL_PROVIDER;
+    const user = options?.user ?? env.SMTP_USER;
+    const pass = options?.pass ?? env.SMTP_PASS;
+    const host = options?.host ?? env.SMTP_HOST ?? "smtp.gmail.com";
+    const port = options?.port ?? env.SMTP_PORT ?? 587;
+    const secure = options?.secure ?? env.SMTP_SECURE ?? false;
+
+    if (provider === "smtp" && user && pass) {
+      // Clean App Password by removing any spaces (Google App Passwords are 16 chars, e.g. 'abcd efgh ijkl mnop')
+      const sanitizedPass = pass.replace(/\s+/g, "");
       this.transporter = nodemailer.createTransport({
-        host: env.SMTP_HOST,
-        port: env.SMTP_PORT,
-        secure: env.SMTP_SECURE,
+        host,
+        port,
+        secure,
+        requireTLS: true, // strictly enforce STARTTLS before sending credentials
         auth: {
-          user: env.SMTP_USER,
-          pass: env.SMTP_PASS,
+          user,
+          pass: sanitizedPass,
         },
       });
     }
@@ -30,6 +47,22 @@ export class EmailService {
 
   public clearSentEmailsForTesting(): void {
     this.sentEmailsForTesting = [];
+  }
+
+  /**
+   * Resolves the 'from' address. For Gmail SMTP, Google enforces that the 'from' header
+   * matches the authenticated user (or an authorized alias). If EMAIL_FROM retains the
+   * default placeholder 'LoveByte <no-reply@lovebyte.app>', we automatically use LoveByte <SMTP_USER>.
+   */
+  public getFromAddress(): string {
+    if (
+      env.EMAIL_PROVIDER === "smtp" &&
+      env.SMTP_USER &&
+      (!env.EMAIL_FROM || env.EMAIL_FROM.includes("no-reply@lovebyte.app"))
+    ) {
+      return `LoveByte <${env.SMTP_USER}>`;
+    }
+    return env.EMAIL_FROM;
   }
 
   private maskEmail(email: string): string {
@@ -91,7 +124,7 @@ export class EmailService {
     const masked = this.maskEmail(to);
 
     // In test or development mock mode:
-    if (env.NODE_ENV === "test" || env.EMAIL_PROVIDER === "mock" || (!this.transporter && !env.RESEND_API_KEY)) {
+    if (env.NODE_ENV === "test" || env.EMAIL_PROVIDER === "mock") {
       this.sentEmailsForTesting.push({
         to,
         subject,
@@ -104,8 +137,39 @@ export class EmailService {
       return;
     }
 
+    // SMTP Provider (via nodemailer / Gmail SMTP)
+    if (env.EMAIL_PROVIDER === "smtp") {
+      if (!this.transporter) {
+        logger.error("SMTP transporter not configured", { recipient: masked });
+        throw new Error("Email delivery failed: SMTP transporter not initialized");
+      }
+
+      try {
+        await this.transporter.sendMail({
+          from: this.getFromAddress(),
+          to,
+          subject,
+          text,
+          html,
+        });
+        logger.info("Email delivered via SMTP", { recipient: masked, type });
+        return;
+      } catch (err: any) {
+        logger.error("Error sending email via SMTP", {
+          code: err?.code,
+          recipient: masked,
+        });
+        throw new Error("Email delivery failed via SMTP");
+      }
+    }
+
     // Resend Provider (via Resend REST API)
-    if (env.EMAIL_PROVIDER === "resend" || Boolean(env.RESEND_API_KEY)) {
+    if (env.EMAIL_PROVIDER === "resend") {
+      if (!env.RESEND_API_KEY) {
+        logger.error("Resend API key not configured", { recipient: masked });
+        throw new Error("Email delivery failed: RESEND_API_KEY not initialized");
+      }
+
       try {
         const response = await fetch("https://api.resend.com/emails", {
           method: "POST",
@@ -114,7 +178,7 @@ export class EmailService {
             "Content-Type": "application/json",
           },
           body: JSON.stringify({
-            from: env.EMAIL_FROM,
+            from: this.getFromAddress(),
             to: [to],
             subject,
             text,
@@ -140,25 +204,14 @@ export class EmailService {
       }
     }
 
-    // SMTP Provider (via nodemailer)
-    if (this.transporter) {
-      try {
-        await this.transporter.sendMail({
-          from: env.EMAIL_FROM,
-          to,
-          subject,
-          text,
-          html,
-        });
-        logger.info("Email delivered via SMTP", { recipient: masked, type });
-      } catch (err: any) {
-        logger.error("Error sending email via SMTP", {
-          code: err?.code,
-          recipient: masked,
-        });
-        throw new Error("Email delivery failed via SMTP");
-      }
-    }
+    logger.warn(`[EMAIL SERVICE] Unhandled provider '${env.EMAIL_PROVIDER}', falling back to mock delivery for ${masked}`);
+    this.sentEmailsForTesting.push({
+      to,
+      subject,
+      otp,
+      type,
+      timestamp: new Date(),
+    });
   }
 }
 

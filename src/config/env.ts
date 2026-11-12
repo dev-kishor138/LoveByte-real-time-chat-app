@@ -20,11 +20,15 @@ const envSchema = z
     EMAIL_PROVIDER: z.enum(["smtp", "resend", "mock"]).default("mock"),
     EMAIL_FROM: z.string().default("LoveByte <no-reply@lovebyte.app>"),
     RESEND_API_KEY: z.string().optional(),
-    SMTP_HOST: z.string().optional(),
+    SMTP_HOST: z.string().default("smtp.gmail.com"),
     SMTP_PORT: z.coerce.number().default(587),
     SMTP_USER: z.string().optional(),
     SMTP_PASS: z.string().optional(),
-    SMTP_SECURE: z.coerce.boolean().default(false),
+    SMTP_SECURE: z
+      .union([z.boolean(), z.string()])
+      .optional()
+      .transform((val) => val === true || val === "true" || val === "1")
+      .default(false),
     OTP_EXPIRES_MINUTES: z.coerce.number().default(15),
     OTP_MAX_ATTEMPTS: z.coerce.number().default(5),
     OTP_COOLDOWN_SECONDS: z.coerce.number().default(60),
@@ -68,6 +72,33 @@ const envSchema = z
           "CORS_ORIGIN cannot be '*' in production (wildcard origin disallowed). Specify explicit comma-separated origins (e.g. 'https://lovebyte-real-time-chat-app.onrender.com')",
         path: ["CORS_ORIGIN"],
       });
+    }
+
+    if (data.NODE_ENV === "production" && data.EMAIL_PROVIDER === "smtp") {
+      if (!data.SMTP_USER || !data.SMTP_USER.trim()) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "SMTP_USER must be configured in production when EMAIL_PROVIDER=smtp (e.g. your Gmail address)",
+          path: ["SMTP_USER"],
+        });
+      }
+      if (!data.SMTP_PASS || !data.SMTP_PASS.trim()) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "SMTP_PASS must be configured in production when EMAIL_PROVIDER=smtp (16-character Google App Password)",
+          path: ["SMTP_PASS"],
+        });
+      }
+    }
+
+    if (data.NODE_ENV === "production" && data.EMAIL_PROVIDER === "resend") {
+      if (!data.RESEND_API_KEY || !data.RESEND_API_KEY.trim()) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "RESEND_API_KEY must be configured in production when EMAIL_PROVIDER=resend",
+          path: ["RESEND_API_KEY"],
+        });
+      }
     }
   });
 
