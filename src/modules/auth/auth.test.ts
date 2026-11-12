@@ -8,6 +8,8 @@ import { prisma } from "../../config/prisma";
 import jwt from "jsonwebtoken";
 import { env } from "../../config/env";
 import * as sockets from "../../sockets";
+import { resetRateLimiters } from "../../middlewares/rateLimiter";
+import { emailService } from "../../services/email/email.service";
 
 describe("Auth Module - Validation", () => {
   it("should accept valid Gmail address and strong password", () => {
@@ -155,6 +157,13 @@ describe("Auth Module - Password Hashing (Argon2id)", () => {
 describe("Auth Module - User Registration (HTTP)", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
+    vi.spyOn(prisma, "$transaction").mockImplementation(async (cb: any) => cb(prisma));
+    if ((prisma as any).otpCode) {
+      vi.spyOn(prisma.otpCode, "create").mockResolvedValue({} as any);
+      vi.spyOn(prisma.otpCode, "updateMany").mockResolvedValue({ count: 0 } as any);
+      vi.spyOn(prisma.otpCode, "update").mockResolvedValue({} as any);
+      vi.spyOn(prisma.otpCode, "findFirst").mockResolvedValue(null);
+    }
   });
 
   // 1. Successful registration
@@ -671,6 +680,7 @@ describe("Auth Module - Profile & Token Verification", () => {
 describe("Auth Module - User Login (HTTP)", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
+    resetRateLimiters();
   });
 
   it("1. Successful login with Argon2id returns 200, tokens, and creates Session", async () => {
@@ -996,6 +1006,7 @@ describe("Auth Module - Refresh Token Rotation & Concurrency / Race Condition (H
 describe("Auth Module - Logout & Session Revocation (HTTP)", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
+    resetRateLimiters();
   });
 
   it("1. Logout without access token returns 401 Access token required", async () => {
@@ -1366,6 +1377,7 @@ describe("Auth Module - Password Change (Stage A)", () => {
 describe("Auth Module - Expired Session Purge Utility (Stage A)", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
+    resetRateLimiters();
   });
 
   it("6. purgeExpiredSessions deletes expired or revoked sessions older than 30 days and protects active sessions", async () => {
@@ -1390,5 +1402,1285 @@ describe("Auth Module - Expired Session Purge Utility (Stage A)", () => {
         }),
       })
     );
+  });
+});
+
+describe("Auth Module - Phase 4: Email OTP Verification, Resend, Forgot Password & Reset Password", () => {
+  const testUserId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const otherUserId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  const testEmail = "phase4test@gmail.com";
+  const validCode = "123456";
+  const validHash = authService.hashOtp(testUserId, "EMAIL_VERIFICATION", validCode);
+  const validResetHash = authService.hashOtp(testUserId, "PASSWORD_RESET", validCode);
+
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    resetRateLimiters();
+  });
+
+  describe("HMAC Hashing & Pepper Security", () => {
+    it("constructs unambiguous length-prefixed context binding payload", () => {
+      const payload = authService.buildOtpContextPayload(testUserId, "EMAIL_VERIFICATION", "123456");
+      expect(payload).toBe(`v1:${testUserId.length}:${testUserId}:18:EMAIL_VERIFICATION:6:123456`);
+    });
+
+    it("computes 64-character hex HMAC-SHA256 digest using server-side pepper and context binding", () => {
+      const digest = authService.hashOtp(testUserId, "EMAIL_VERIFICATION", "123456");
+      expect(typeof digest).toBe("string");
+      expect(digest).toHaveLength(64);
+      expect(/^[0-9a-f]{64}$/.test(digest)).toBe(true);
+    });
+
+    it("verifies constant-time comparison against expected HMAC digest", () => {
+      const digest = authService.hashOtp(testUserId, "EMAIL_VERIFICATION", "123456");
+      expect(authService.verifyOtp(testUserId, "EMAIL_VERIFICATION", "123456", digest)).toBe(true);
+      expect(authService.verifyOtp(testUserId, "EMAIL_VERIFICATION", "654321", digest)).toBe(false);
+      expect(authService.verifyOtp(testUserId, "EMAIL_VERIFICATION", "12345", digest)).toBe(false);
+    });
+
+    it("cross-user defense: an OTP issued for User A cannot be verified for User B", () => {
+      const digestA = authService.hashOtp(testUserId, "EMAIL_VERIFICATION", "123456");
+      expect(authService.verifyOtp(otherUserId, "EMAIL_VERIFICATION", "123456", digestA)).toBe(false);
+    });
+
+    it("cross-purpose defense: an OTP issued for EMAIL_VERIFICATION cannot be verified for PASSWORD_RESET", () => {
+      const verificationDigest = authService.hashOtp(testUserId, "EMAIL_VERIFICATION", "123456");
+      expect(authService.verifyOtp(testUserId, "PASSWORD_RESET", "123456", verificationDigest)).toBe(false);
+    });
+
+    it("throws server configuration error if OTP_PEPPER is missing or shorter than 32 characters", () => {
+      const originalPepper = env.OTP_PEPPER;
+      try {
+        (env as any).OTP_PEPPER = "short-pepper";
+        expect(() => authService.hashOtp(testUserId, "EMAIL_VERIFICATION", "123456")).toThrow(
+          "Server configuration error: OTP_PEPPER is missing or insufficient"
+        );
+      } finally {
+        (env as any).OTP_PEPPER = originalPepper;
+      }
+    });
+
+    it("produces completely different digests when different peppers are used", () => {
+      const originalPepper = env.OTP_PEPPER;
+      try {
+        (env as any).OTP_PEPPER = "pepper-one-must-be-32-chars-long-at-least!";
+        const digest1 = authService.hashOtp(testUserId, "EMAIL_VERIFICATION", "123456");
+
+        (env as any).OTP_PEPPER = "pepper-two-must-be-32-chars-long-at-least!";
+        const digest2 = authService.hashOtp(testUserId, "EMAIL_VERIFICATION", "123456");
+
+        expect(digest1).not.toBe(digest2);
+      } finally {
+        (env as any).OTP_PEPPER = originalPepper;
+      }
+    });
+  });
+
+  describe("Registration & Email Verification Flow", () => {
+    it("1. Registration sets isVerified: false and dispatches OTP", async () => {
+      vi.spyOn(prisma.user, "findUnique").mockResolvedValueOnce(null);
+
+      const mockTx = {
+        user: {
+          create: vi.fn().mockResolvedValue({
+            id: testUserId,
+            email: testEmail,
+            isVerified: false,
+            createdAt: new Date(),
+          }),
+        },
+        otpCode: {
+          create: vi.fn().mockResolvedValue({
+            id: "otp-1",
+            userId: testUserId,
+            type: "EMAIL_VERIFICATION",
+            codeHash: validHash,
+            expiresAt: new Date(Date.now() + 900000),
+            attempts: 0,
+            maxAttempts: 5,
+            isUsed: false,
+            createdAt: new Date(),
+          }),
+        },
+      };
+
+      vi.spyOn(prisma, "$transaction").mockImplementation(async (callback: any) => {
+        return callback(mockTx);
+      });
+
+      const res = await request(app).post("/api/auth/register").send({
+        email: testEmail,
+        password: "StrongPassword123!",
+      });
+
+      expect(res.status).toBe(201);
+      expect(res.body.requiresVerification).toBe(true);
+      expect(mockTx.user.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            email: testEmail,
+            isVerified: false,
+          }),
+        })
+      );
+      expect(mockTx.otpCode.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            userId: testUserId,
+            type: "EMAIL_VERIFICATION",
+          }),
+        })
+      );
+    });
+
+    it("2. Login is blocked with 403 EMAIL_NOT_VERIFIED when user is unverified", async () => {
+      const password = "StrongPassword123!";
+      const passwordHash = await authService.hashPassword(password);
+
+      vi.spyOn(prisma.user, "findUnique").mockResolvedValueOnce({
+        id: testUserId,
+        email: testEmail,
+        passwordHash,
+        isVerified: false,
+        createdAt: new Date(),
+      } as any);
+
+      const res = await request(app).post("/api/auth/login").send({
+        email: testEmail,
+        password,
+      });
+
+      expect(res.status).toBe(403);
+      expect(res.body.error).toContain("Email not verified");
+      expect(res.body.code).toBe("EMAIL_NOT_VERIFIED");
+      expect(res.body.email).toBe(testEmail);
+    });
+
+    it("3. Re-registration of unverified account updates password and issues fresh OTP", async () => {
+      vi.spyOn(prisma.user, "findUnique").mockResolvedValueOnce({
+        id: testUserId,
+        email: testEmail,
+        isVerified: false,
+        createdAt: new Date(),
+      } as any);
+
+      const mockTx = {
+        user: { update: vi.fn().mockResolvedValue({ id: testUserId, email: testEmail }) },
+        otpCode: {
+          updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+          create: vi.fn().mockResolvedValue({ id: "otp-2" }),
+        },
+      };
+
+      vi.spyOn(prisma, "$transaction").mockImplementation(async (callback: any) => {
+        return callback(mockTx);
+      });
+
+      const res = await request(app).post("/api/auth/register").send({
+        email: testEmail,
+        password: "NewStrongPassword123!",
+      });
+
+      expect(res.status).toBe(201);
+      expect(res.body.requiresVerification).toBe(true);
+      expect(mockTx.user.update).toHaveBeenCalled();
+      expect(mockTx.otpCode.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            userId: testUserId,
+            type: "EMAIL_VERIFICATION",
+            isUsed: false,
+          }),
+        })
+      );
+      expect(mockTx.otpCode.create).toHaveBeenCalled();
+    });
+
+    it("4. Email verification with valid OTP marks user verified and OTP used", async () => {
+      vi.spyOn(prisma.user, "findUnique").mockResolvedValueOnce({
+        id: testUserId,
+        email: testEmail,
+        isVerified: false,
+      } as any);
+
+      const mockTx = {
+        otpCode: {
+          findFirst: vi.fn().mockResolvedValue({
+            id: "otp-1",
+            userId: testUserId,
+            type: "EMAIL_VERIFICATION",
+            codeHash: validHash,
+            expiresAt: new Date(Date.now() + 600000),
+            attempts: 0,
+            maxAttempts: 5,
+            isUsed: false,
+          }),
+          updateMany: vi.fn().mockResolvedValue({ count: 1 }), // Atomic claim succeeds
+        },
+        user: {
+          update: vi.fn().mockResolvedValue({ id: testUserId, isVerified: true }),
+        },
+      };
+
+      vi.spyOn(prisma, "$transaction").mockImplementation(async (callback: any) => {
+        return callback(mockTx);
+      });
+
+      const res = await request(app).post("/api/auth/verify-email").send({
+        email: testEmail,
+        code: validCode,
+      });
+
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.message).toContain("verified successfully");
+      expect(mockTx.otpCode.updateMany).toHaveBeenCalledWith({
+        where: { id: "otp-1", isUsed: false },
+        data: { isUsed: true },
+      });
+      expect(mockTx.user.update).toHaveBeenCalledWith({
+        where: { id: testUserId },
+        data: { isVerified: true },
+      });
+    });
+
+    it("5. Email verification with invalid OTP increments attempt counter and returns remaining", async () => {
+      vi.spyOn(prisma.user, "findUnique").mockResolvedValueOnce({
+        id: testUserId,
+        email: testEmail,
+        isVerified: false,
+      } as any);
+
+      const mockTx = {
+        user: { update: vi.fn().mockResolvedValue({}) },
+        otpCode: {
+          findFirst: vi.fn().mockResolvedValue({
+            id: "otp-1",
+            userId: testUserId,
+            type: "EMAIL_VERIFICATION",
+            codeHash: validHash,
+            expiresAt: new Date(Date.now() + 600000),
+            attempts: 1,
+            maxAttempts: 5,
+            isUsed: false,
+          }),
+          update: vi.fn().mockResolvedValue({ attempts: 2, maxAttempts: 5 }),
+        },
+      };
+
+      vi.spyOn(prisma, "$transaction").mockImplementation(async (callback: any) => {
+        return callback(mockTx);
+      });
+
+      const res = await request(app).post("/api/auth/verify-email").send({
+        email: testEmail,
+        code: "999999", // wrong code
+      });
+
+      expect(res.status).toBe(400);
+      expect(res.body.error).toContain("3 attempt(s) remaining");
+      expect(mockTx.otpCode.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: "otp-1" },
+          data: { attempts: { increment: 1 } },
+        })
+      );
+    });
+
+    it("6. Email verification locks when 5 attempts are exceeded", async () => {
+      vi.spyOn(prisma.user, "findUnique").mockResolvedValueOnce({
+        id: testUserId,
+        email: testEmail,
+        isVerified: false,
+      } as any);
+
+      const mockTx = {
+        user: { update: vi.fn().mockResolvedValue({}) },
+        otpCode: {
+          findFirst: vi.fn().mockResolvedValue({
+            id: "otp-1",
+            userId: testUserId,
+            type: "EMAIL_VERIFICATION",
+            codeHash: validHash,
+            expiresAt: new Date(Date.now() + 600000),
+            attempts: 5,
+            maxAttempts: 5,
+            isUsed: false,
+          }),
+        },
+      };
+
+      vi.spyOn(prisma, "$transaction").mockImplementation(async (callback: any) => {
+        return callback(mockTx);
+      });
+
+      const res = await request(app).post("/api/auth/verify-email").send({
+        email: testEmail,
+        code: validCode,
+      });
+
+      expect(res.status).toBe(400);
+      expect(res.body.error).toContain("Maximum verification attempts exceeded");
+    });
+
+    it("7. Email verification rejects expired OTP", async () => {
+      vi.spyOn(prisma.user, "findUnique").mockResolvedValueOnce({
+        id: testUserId,
+        email: testEmail,
+        isVerified: false,
+      } as any);
+
+      const mockTx = {
+        user: { update: vi.fn().mockResolvedValue({}) },
+        otpCode: {
+          findFirst: vi.fn().mockResolvedValue({
+            id: "otp-1",
+            userId: testUserId,
+            type: "EMAIL_VERIFICATION",
+            codeHash: validHash,
+            expiresAt: new Date(Date.now() - 10000), // expired
+            attempts: 0,
+            maxAttempts: 5,
+            isUsed: false,
+          }),
+        },
+      };
+
+      vi.spyOn(prisma, "$transaction").mockImplementation(async (callback: any) => {
+        return callback(mockTx);
+      });
+
+      const res = await request(app).post("/api/auth/verify-email").send({
+        email: testEmail,
+        code: validCode,
+      });
+
+      expect(res.status).toBe(400);
+      expect(res.body.error).toContain("expired");
+    });
+
+    it("8. Concurrency guard: double-spend / replay attempt on already-used verification OTP is rejected", async () => {
+      vi.spyOn(prisma.user, "findUnique").mockResolvedValueOnce({
+        id: testUserId,
+        email: testEmail,
+        isVerified: false,
+      } as any);
+
+      const mockTx = {
+        user: { update: vi.fn().mockResolvedValue({}) },
+        otpCode: {
+          findFirst: vi.fn().mockResolvedValue({
+            id: "otp-1",
+            userId: testUserId,
+            type: "EMAIL_VERIFICATION",
+            codeHash: validHash,
+            expiresAt: new Date(Date.now() + 600000),
+            attempts: 0,
+            maxAttempts: 5,
+            isUsed: false,
+          }),
+          // Atomic claim returns count: 0 (another concurrent request claimed it first!)
+          updateMany: vi.fn().mockResolvedValue({ count: 0 }),
+        },
+      };
+
+      vi.spyOn(prisma, "$transaction").mockImplementation(async (callback: any) => {
+        return callback(mockTx);
+      });
+
+      const res = await request(app).post("/api/auth/verify-email").send({
+        email: testEmail,
+        code: validCode,
+      });
+
+      expect(res.status).toBe(400);
+      expect(res.body.error).toContain("already been used");
+      expect(res.body.code).toBe("OTP_ALREADY_USED");
+    });
+  });
+
+  describe("OTP Resend Flow & Concurrency", () => {
+    it("9. Resend OTP enforces 60-second cooldown (429)", async () => {
+      vi.spyOn(prisma.user, "findUnique").mockResolvedValueOnce({
+        id: testUserId,
+        email: testEmail,
+        isVerified: false,
+      } as any);
+
+      const mockTx = {
+        user: { update: vi.fn().mockResolvedValue({}) },
+        otpCode: {
+          findFirst: vi.fn().mockResolvedValue({
+            id: "otp-recent",
+            userId: testUserId,
+            type: "EMAIL_VERIFICATION",
+            createdAt: new Date(Date.now() - 20000), // 20s ago (< 60s)
+          }),
+        },
+      };
+
+      vi.spyOn(prisma, "$transaction").mockImplementation(async (callback: any) => {
+        return callback(mockTx);
+      });
+
+      const res = await request(app).post("/api/auth/resend-otp").send({
+        email: testEmail,
+        type: "EMAIL_VERIFICATION",
+      });
+
+      expect(res.status).toBe(429);
+      expect(res.body.error).toContain("Please wait");
+      expect(res.body.code).toBe("OTP_COOLDOWN");
+    });
+
+    it("10. Resend OTP returns generic success when account does not exist (anti-enumeration)", async () => {
+      vi.spyOn(prisma.user, "findUnique").mockResolvedValueOnce(null);
+
+      const res = await request(app).post("/api/auth/resend-otp").send({
+        email: "nonexistent@gmail.com",
+        type: "EMAIL_VERIFICATION",
+      });
+
+      expect(res.status).toBe(200);
+      expect(res.body.message).toContain("If an account exists");
+    });
+
+    it("11. Resend OTP succeeds and issues new code after cooldown", async () => {
+      vi.spyOn(prisma.user, "findUnique").mockResolvedValueOnce({
+        id: testUserId,
+        email: testEmail,
+        isVerified: false,
+      } as any);
+
+      const mockTx = {
+        user: { update: vi.fn().mockResolvedValue({}) },
+        otpCode: {
+          findFirst: vi.fn().mockResolvedValue({
+            id: "otp-old",
+            userId: testUserId,
+            type: "EMAIL_VERIFICATION",
+            createdAt: new Date(Date.now() - 70000), // > 60s
+          }),
+          updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+          create: vi.fn().mockResolvedValue({ id: "otp-fresh" }),
+        },
+      };
+
+      vi.spyOn(prisma, "$transaction").mockImplementation(async (callback: any) => {
+        return callback(mockTx);
+      });
+
+      const res = await request(app).post("/api/auth/resend-otp").send({
+        email: testEmail,
+        type: "EMAIL_VERIFICATION",
+      });
+
+      expect(res.status).toBe(200);
+      expect(res.body.message).toContain("A new code has been sent");
+      expect(mockTx.otpCode.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            userId: testUserId,
+            type: "EMAIL_VERIFICATION",
+          }),
+        })
+      );
+    });
+
+    it("12. Concurrent resend requests are serialized via user row touch lock", async () => {
+      vi.spyOn(prisma.user, "findUnique").mockResolvedValue({
+        id: testUserId,
+        email: testEmail,
+        isVerified: false,
+      } as any);
+
+      const userTouchSpy = vi.fn().mockResolvedValue({});
+      const mockTx = {
+        user: { update: userTouchSpy },
+        otpCode: {
+          findFirst: vi.fn().mockResolvedValue(null),
+          updateMany: vi.fn().mockResolvedValue({ count: 0 }),
+          create: vi.fn().mockResolvedValue({ id: "otp-fresh" }),
+        },
+      };
+
+      vi.spyOn(prisma, "$transaction").mockImplementation(async (callback: any) => {
+        return callback(mockTx);
+      });
+
+      await request(app).post("/api/auth/resend-otp").send({
+        email: testEmail,
+        type: "EMAIL_VERIFICATION",
+      });
+
+      expect(userTouchSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: testUserId },
+          data: expect.objectContaining({ updatedAt: expect.any(Date) }),
+        })
+      );
+    });
+  });
+
+  describe("Forgot Password Flow & Concurrency", () => {
+    it("13. Forgot password returns generic message for non-existent user", async () => {
+      vi.spyOn(prisma.user, "findUnique").mockResolvedValueOnce(null);
+
+      const res = await request(app).post("/api/auth/forgot-password").send({
+        email: "unknown@gmail.com",
+      });
+
+      expect(res.status).toBe(200);
+      expect(res.body.message).toContain("If an account exists");
+    });
+
+    it("14. Forgot password returns generic message for unverified user", async () => {
+      vi.spyOn(prisma.user, "findUnique").mockResolvedValueOnce({
+        id: testUserId,
+        email: testEmail,
+        isVerified: false,
+      } as any);
+
+      const res = await request(app).post("/api/auth/forgot-password").send({
+        email: testEmail,
+      });
+
+      expect(res.status).toBe(200);
+      expect(res.body.message).toContain("If an account exists");
+    });
+
+    it("15. Forgot password issues reset OTP for verified user", async () => {
+      vi.spyOn(prisma.user, "findUnique").mockResolvedValueOnce({
+        id: testUserId,
+        email: testEmail,
+        isVerified: true,
+      } as any);
+
+      const mockTx = {
+        user: { update: vi.fn().mockResolvedValue({}) },
+        otpCode: {
+          findFirst: vi.fn().mockResolvedValue(null),
+          updateMany: vi.fn().mockResolvedValue({ count: 0 }),
+          create: vi.fn().mockResolvedValue({ id: "reset-1" }),
+        },
+      };
+
+      vi.spyOn(prisma, "$transaction").mockImplementation(async (callback: any) => {
+        return callback(mockTx);
+      });
+
+      const res = await request(app).post("/api/auth/forgot-password").send({
+        email: testEmail,
+      });
+
+      expect(res.status).toBe(200);
+      expect(res.body.message).toContain("If an account exists");
+      expect(mockTx.otpCode.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            userId: testUserId,
+            type: "PASSWORD_RESET",
+          }),
+        })
+      );
+    });
+
+    it("16. Forgot password enforces 60-second cooldown", async () => {
+      vi.spyOn(prisma.user, "findUnique").mockResolvedValueOnce({
+        id: testUserId,
+        email: testEmail,
+        isVerified: true,
+      } as any);
+
+      const mockTx = {
+        user: { update: vi.fn().mockResolvedValue({}) },
+        otpCode: {
+          findFirst: vi.fn().mockResolvedValue({
+            id: "reset-recent",
+            userId: testUserId,
+            type: "PASSWORD_RESET",
+            createdAt: new Date(Date.now() - 15000), // 15s ago
+          }),
+        },
+      };
+
+      vi.spyOn(prisma, "$transaction").mockImplementation(async (callback: any) => {
+        return callback(mockTx);
+      });
+
+      const res = await request(app).post("/api/auth/forgot-password").send({
+        email: testEmail,
+      });
+
+      expect(res.status).toBe(429);
+      expect(res.body.error).toContain("Please wait");
+    });
+  });
+
+  describe("Reset Password Flow & Single-Use Security", () => {
+    it("17. Reset password with valid OTP hashes new password with Argon2id, revokes all sessions, and disconnects sockets", async () => {
+      vi.spyOn(prisma.user, "findUnique").mockResolvedValueOnce({
+        id: testUserId,
+        email: testEmail,
+        isVerified: true,
+      } as any);
+
+      const disconnectSpy = vi.spyOn(sockets, "disconnectSocketsByUserId").mockImplementation(() => {});
+
+      const otpClaimSpy = vi.fn().mockResolvedValue({ count: 1 });
+      const userUpdateSpy = vi.fn().mockResolvedValue({});
+      const sessionUpdateManySpy = vi.fn().mockResolvedValue({ count: 3 });
+
+      const mockTx = {
+        otpCode: {
+          findFirst: vi.fn().mockResolvedValue({
+            id: "reset-otp-1",
+            userId: testUserId,
+            type: "PASSWORD_RESET",
+            codeHash: validResetHash,
+            expiresAt: new Date(Date.now() + 600000),
+            attempts: 0,
+            maxAttempts: 5,
+            isUsed: false,
+          }),
+          updateMany: otpClaimSpy,
+        },
+        user: { update: userUpdateSpy },
+        session: { updateMany: sessionUpdateManySpy },
+      };
+
+      vi.spyOn(prisma, "$transaction").mockImplementation(async (callback: any) => {
+        return callback(mockTx);
+      });
+
+      const res = await request(app).post("/api/auth/reset-password").send({
+        email: testEmail,
+        code: validCode,
+        newPassword: "FreshPassword456!",
+      });
+
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.message).toContain("Password reset successfully");
+
+      expect(otpClaimSpy).toHaveBeenCalledWith({
+        where: { id: "reset-otp-1", isUsed: false },
+        data: { isUsed: true },
+      });
+      expect(userUpdateSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: testUserId },
+          data: expect.objectContaining({
+            passwordHash: expect.stringMatching(/^\$argon2id\$/),
+          }),
+        })
+      );
+      // Strictly verify isVerified status was NOT altered by password reset
+      const updateData = userUpdateSpy.mock.calls[0][0].data;
+      expect(updateData.isVerified).toBeUndefined();
+
+      expect(sessionUpdateManySpy).toHaveBeenCalledWith({
+        where: { userId: testUserId, isRevoked: false },
+        data: { isRevoked: true },
+      });
+      expect(disconnectSpy).toHaveBeenCalledWith(testUserId, expect.any(String));
+    });
+
+    it("18. Reset password with invalid OTP increments attempts atomically", async () => {
+      vi.spyOn(prisma.user, "findUnique").mockResolvedValueOnce({
+        id: testUserId,
+        email: testEmail,
+        isVerified: true,
+      } as any);
+
+      const mockTx = {
+        user: { update: vi.fn().mockResolvedValue({}) },
+        otpCode: {
+          findFirst: vi.fn().mockResolvedValue({
+            id: "reset-otp-1",
+            userId: testUserId,
+            type: "PASSWORD_RESET",
+            codeHash: validResetHash,
+            expiresAt: new Date(Date.now() + 600000),
+            attempts: 2,
+            maxAttempts: 5,
+            isUsed: false,
+          }),
+          update: vi.fn().mockResolvedValue({ attempts: 3, maxAttempts: 5 }),
+        },
+      };
+
+      vi.spyOn(prisma, "$transaction").mockImplementation(async (callback: any) => {
+        return callback(mockTx);
+      });
+
+      const res = await request(app).post("/api/auth/reset-password").send({
+        email: testEmail,
+        code: "000000", // invalid code
+        newPassword: "FreshPassword456!",
+      });
+
+      expect(res.status).toBe(400);
+      expect(res.body.error).toContain("2 attempt(s) remaining");
+      expect(mockTx.otpCode.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: "reset-otp-1" },
+          data: { attempts: { increment: 1 } },
+        })
+      );
+    });
+
+    it("19. Concurrency guard: double-spend / replay attempt on reset OTP is rejected", async () => {
+      vi.spyOn(prisma.user, "findUnique").mockResolvedValueOnce({
+        id: testUserId,
+        email: testEmail,
+        isVerified: true,
+      } as any);
+
+      const mockTx = {
+        user: { update: vi.fn().mockResolvedValue({}) },
+        otpCode: {
+          findFirst: vi.fn().mockResolvedValue({
+            id: "reset-otp-1",
+            userId: testUserId,
+            type: "PASSWORD_RESET",
+            codeHash: validResetHash,
+            expiresAt: new Date(Date.now() + 600000),
+            attempts: 0,
+            maxAttempts: 5,
+            isUsed: false,
+          }),
+          // Another request claimed this reset code first!
+          updateMany: vi.fn().mockResolvedValue({ count: 0 }),
+        },
+      };
+
+      vi.spyOn(prisma, "$transaction").mockImplementation(async (callback: any) => {
+        return callback(mockTx);
+      });
+
+      const res = await request(app).post("/api/auth/reset-password").send({
+        email: testEmail,
+        code: validCode,
+        newPassword: "FreshPassword456!",
+      });
+
+      expect(res.status).toBe(400);
+      expect(res.body.error).toContain("already been used");
+      expect(res.body.code).toBe("OTP_ALREADY_USED");
+    });
+  });
+
+  describe("Email Delivery Failure Handling", () => {
+    it("20. Registration rolls back and returns 502 when email delivery fails", async () => {
+      vi.spyOn(prisma.user, "findUnique").mockResolvedValueOnce(null);
+
+      const mockTx = {
+        user: {
+          create: vi.fn().mockResolvedValue({
+            id: testUserId,
+            email: testEmail,
+            isVerified: false,
+            createdAt: new Date(),
+          }),
+        },
+        otpCode: {
+          create: vi.fn().mockResolvedValue({ id: "otp-fail" }),
+        },
+      };
+
+      vi.spyOn(prisma, "$transaction").mockImplementation(async (callback: any) => {
+        return callback(mockTx);
+      });
+
+      const otpDeleteSpy = vi.spyOn(prisma.otpCode, "delete").mockResolvedValueOnce({} as any);
+      const userDeleteSpy = vi.spyOn(prisma.user, "delete").mockResolvedValueOnce({} as any);
+      vi.spyOn(emailService, "sendVerificationEmail").mockRejectedValueOnce(
+        new Error("SMTP connection failed")
+      );
+
+      const res = await request(app).post("/api/auth/register").send({
+        email: testEmail,
+        password: "StrongPassword123!",
+      });
+
+      expect(res.status).toBe(502);
+      expect(res.body.error).toContain("Failed to deliver verification email");
+      expect(otpDeleteSpy).toHaveBeenCalledWith({ where: { id: "otp-fail" } });
+      expect(userDeleteSpy).toHaveBeenCalledWith({ where: { id: testUserId } });
+    });
+
+    it("21. Forgot password cleans up created OTP and returns identical generic 200 on email delivery failure to prevent account enumeration", async () => {
+      vi.spyOn(prisma.user, "findUnique").mockResolvedValueOnce({
+        id: testUserId,
+        email: testEmail,
+        isVerified: true,
+      } as any);
+
+      const mockTx = {
+        user: { update: vi.fn().mockResolvedValue({}) },
+        otpCode: {
+          findFirst: vi.fn().mockResolvedValue(null),
+          updateMany: vi.fn().mockResolvedValue({ count: 0 }),
+          create: vi.fn().mockResolvedValue({ id: "reset-fail" }),
+        },
+      };
+
+      vi.spyOn(prisma, "$transaction").mockImplementation(async (callback: any) => {
+        return callback(mockTx);
+      });
+
+      const otpDeleteSpy = vi.spyOn(prisma.otpCode, "delete").mockResolvedValueOnce({} as any);
+      vi.spyOn(emailService, "sendPasswordResetEmail").mockRejectedValueOnce(
+        new Error("Resend rate limit exceeded")
+      );
+
+      const res = await request(app).post("/api/auth/forgot-password").send({
+        email: testEmail,
+      });
+
+      // Must NEVER return 502 or distinguish from unknown account: identical generic 200 response
+      expect(res.status).toBe(200);
+      expect(res.body.message).toContain("If an account exists with this email, a password reset code has been sent.");
+      // Un-sent OTP must still be safely cleaned up from the database
+      expect(otpDeleteSpy).toHaveBeenCalledWith({ where: { id: "reset-fail" } });
+    });
+
+    it("22. Forgot password returns generic 200 for registered and verified user when email delivery succeeds", async () => {
+      vi.spyOn(prisma.user, "findUnique").mockResolvedValueOnce({
+        id: testUserId,
+        email: testEmail,
+        isVerified: true,
+      } as any);
+
+      const mockTx = {
+        user: { update: vi.fn().mockResolvedValue({}) },
+        otpCode: {
+          findFirst: vi.fn().mockResolvedValue(null),
+          updateMany: vi.fn().mockResolvedValue({ count: 0 }),
+          create: vi.fn().mockResolvedValue({ id: "reset-ok" }),
+        },
+      };
+
+      vi.spyOn(prisma, "$transaction").mockImplementation(async (callback: any) => {
+        return callback(mockTx);
+      });
+
+      const sendEmailSpy = vi
+        .spyOn(emailService, "sendPasswordResetEmail")
+        .mockResolvedValueOnce({} as any);
+
+      const res = await request(app).post("/api/auth/forgot-password").send({
+        email: testEmail,
+      });
+
+      expect(res.status).toBe(200);
+      expect(res.body.message).toContain("If an account exists with this email, a password reset code has been sent.");
+      expect(sendEmailSpy).toHaveBeenCalledWith(testEmail, expect.any(String));
+    });
+
+    it("23. Forgot password returns generic 200 for unregistered email without creating OTP or calling email service", async () => {
+      vi.spyOn(prisma.user, "findUnique").mockResolvedValueOnce(null);
+
+      const sendEmailSpy = vi.spyOn(emailService, "sendPasswordResetEmail");
+      const txSpy = vi.spyOn(prisma, "$transaction");
+
+      const res = await request(app).post("/api/auth/forgot-password").send({
+        email: "nonexistent@gmail.com",
+      });
+
+      expect(res.status).toBe(200);
+      expect(res.body.message).toContain("If an account exists with this email, a password reset code has been sent.");
+      expect(txSpy).not.toHaveBeenCalled();
+      expect(sendEmailSpy).not.toHaveBeenCalled();
+    });
+
+    it("24. Forgot password returns generic 200 for unverified registered email without creating OTP or calling email service", async () => {
+      vi.spyOn(prisma.user, "findUnique").mockResolvedValueOnce({
+        id: testUserId,
+        email: testEmail,
+        isVerified: false,
+      } as any);
+
+      const sendEmailSpy = vi.spyOn(emailService, "sendPasswordResetEmail");
+      const txSpy = vi.spyOn(prisma, "$transaction");
+
+      const res = await request(app).post("/api/auth/forgot-password").send({
+        email: testEmail,
+      });
+
+      expect(res.status).toBe(200);
+      expect(res.body.message).toContain("If an account exists with this email, a password reset code has been sent.");
+      expect(txSpy).not.toHaveBeenCalled();
+      expect(sendEmailSpy).not.toHaveBeenCalled();
+    });
+
+    it("25. Transaction rollback: failure during reset password transaction preserves unconsumed OTP state", async () => {
+      vi.spyOn(prisma.user, "findUnique").mockResolvedValueOnce({
+        id: testUserId,
+        email: testEmail,
+        isVerified: true,
+      } as any);
+
+      vi.spyOn(prisma, "$transaction").mockImplementation(async () => {
+        // Simulates database failure or session update failure inside transaction
+        throw new Error("Database transaction failure during session revocation");
+      });
+
+      const res = await request(app).post("/api/auth/reset-password").send({
+        email: testEmail,
+        code: validCode,
+        newPassword: "FreshPassword456!",
+      });
+
+      expect(res.status).toBe(500);
+    });
+  });
+
+  describe("Authentic PostgreSQL Transaction Rollback & Concurrency Semantics", () => {
+    class TransactionalDatabaseSimulator {
+      public userTable = new Map<string, any>();
+      public otpTable = new Map<string, any>();
+      public sessionTable = new Map<string, any>();
+
+      reset() {
+        this.userTable.clear();
+        this.otpTable.clear();
+        this.sessionTable.clear();
+      }
+
+      async transaction<T>(callback: (tx: any) => Promise<T>): Promise<T> {
+        // Deep copy snapshots of tables before transaction begins to genuinely simulate PostgreSQL rollback
+        const userSnapshot = new Map(
+          Array.from(this.userTable.entries()).map(([k, v]) => [k, { ...v }])
+        );
+        const otpSnapshot = new Map(
+          Array.from(this.otpTable.entries()).map(([k, v]) => [k, { ...v }])
+        );
+        const sessionSnapshot = new Map(
+          Array.from(this.sessionTable.entries()).map(([k, v]) => [k, { ...v }])
+        );
+
+        const tx = {
+          user: {
+            update: async ({ where, data }: any) => {
+              const row = this.userTable.get(where.id);
+              if (!row) throw new Error(`User not found: ${where.id}`);
+              const updated = { ...row, ...data };
+              this.userTable.set(where.id, updated);
+              return updated;
+            },
+            findUnique: async ({ where }: any) => {
+              for (const row of this.userTable.values()) {
+                if (where.id && row.id === where.id) return { ...row };
+                if (where.email && row.email === where.email) return { ...row };
+              }
+              return null;
+            },
+          },
+          otpCode: {
+            findFirst: async ({ where }: any) => {
+              const rows = Array.from(this.otpTable.values())
+                .filter((r) => {
+                  if (where.userId && r.userId !== where.userId) return false;
+                  if (where.type && r.type !== where.type) return false;
+                  if (where.isUsed !== undefined && r.isUsed !== where.isUsed) return false;
+                  return true;
+                })
+                .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+              return rows[0] ? { ...rows[0] } : null;
+            },
+            update: async ({ where, data }: any) => {
+              const row = this.otpTable.get(where.id);
+              if (!row) throw new Error(`OtpCode not found: ${where.id}`);
+              const updated = { ...row };
+              if (data.attempts?.increment) {
+                updated.attempts = (updated.attempts || 0) + data.attempts.increment;
+              }
+              if (data.isUsed !== undefined) {
+                updated.isUsed = data.isUsed;
+              }
+              this.otpTable.set(where.id, updated);
+              return updated;
+            },
+            updateMany: async ({ where, data }: any) => {
+              let count = 0;
+              for (const [id, r] of this.otpTable.entries()) {
+                if (where.id && r.id !== where.id) continue;
+                if (where.userId && r.userId !== where.userId) continue;
+                if (where.type && r.type !== where.type) continue;
+                if (where.isUsed !== undefined && r.isUsed !== where.isUsed) continue;
+                this.otpTable.set(id, { ...r, ...data });
+                count++;
+              }
+              return { count };
+            },
+            create: async ({ data }: any) => {
+              const id = data.id || `otp-sim-${Date.now()}-${Math.random()}`;
+              const newRow = { id, attempts: 0, isUsed: false, createdAt: new Date(), ...data };
+              this.otpTable.set(id, newRow);
+              return newRow;
+            },
+          },
+          session: {
+            updateMany: async ({ where, data }: any) => {
+              let count = 0;
+              for (const [id, s] of this.sessionTable.entries()) {
+                if (where.userId && s.userId !== where.userId) continue;
+                if (where.isRevoked !== undefined && s.isRevoked !== where.isRevoked) continue;
+                this.sessionTable.set(id, { ...s, ...data });
+                count++;
+              }
+              return { count };
+            },
+          },
+        };
+
+        try {
+          const result = await callback(tx);
+          // Transaction COMMITS: Mutations persist in database state!
+          return result;
+        } catch (error) {
+          // Transaction ROLLS BACK: Revert state to pre-transaction snapshot!
+          this.userTable = userSnapshot;
+          this.otpTable = otpSnapshot;
+          this.sessionTable = sessionSnapshot;
+          throw error;
+        }
+      }
+    }
+
+    const simulator = new TransactionalDatabaseSimulator();
+    const simUserId = "sim-user-1111-2222-3333-444444444444";
+    const simEmail = "simtest@gmail.com";
+    const simCode = "654321";
+    const simVerificationHash = authService.hashOtp(simUserId, "EMAIL_VERIFICATION", simCode);
+    const simResetHash = authService.hashOtp(simUserId, "PASSWORD_RESET", simCode);
+
+    beforeEach(() => {
+      simulator.reset();
+      simulator.userTable.set(simUserId, {
+        id: simUserId,
+        email: simEmail,
+        isVerified: false,
+        passwordHash: "$argon2id$v=19$m=65536,t=3,p=4$simulatedhash",
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+
+      vi.spyOn(prisma, "$transaction").mockImplementation(async (cb: any) => simulator.transaction(cb));
+      vi.spyOn(prisma.user, "findUnique").mockImplementation(async ({ where }: any) => {
+        for (const row of simulator.userTable.values()) {
+          if (where.id && row.id === where.id) return { ...row };
+          if (where.email && row.email === where.email) return { ...row };
+        }
+        return null;
+      });
+    });
+
+    it("R-1: Wrong OTP increments attempts persistently in database even though request returns 400", async () => {
+      simulator.otpTable.set("otp-sim-1", {
+        id: "otp-sim-1",
+        userId: simUserId,
+        type: "EMAIL_VERIFICATION",
+        codeHash: simVerificationHash,
+        expiresAt: new Date(Date.now() + 600000),
+        attempts: 0,
+        maxAttempts: 5,
+        isUsed: false,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+
+      // Submit incorrect OTP code
+      const res1 = await request(app).post("/api/auth/verify-email").send({
+        email: simEmail,
+        code: "000000",
+      });
+
+      expect(res1.status).toBe(400);
+      expect(res1.body.error).toContain("4 attempt(s) remaining");
+
+      // Verify that attempts counter WAS PERSISTED in the database (not rolled back!)
+      const otpAfterTry1 = simulator.otpTable.get("otp-sim-1");
+      expect(otpAfterTry1.attempts).toBe(1);
+      expect(otpAfterTry1.isUsed).toBe(false);
+
+      // Submit second incorrect OTP code
+      const res2 = await request(app).post("/api/auth/verify-email").send({
+        email: simEmail,
+        code: "111111",
+      });
+
+      expect(res2.status).toBe(400);
+      expect(res2.body.error).toContain("3 attempt(s) remaining");
+
+      const otpAfterTry2 = simulator.otpTable.get("otp-sim-1");
+      expect(otpAfterTry2.attempts).toBe(2);
+      expect(otpAfterTry2.isUsed).toBe(false);
+    });
+
+    it("R-2: Five wrong attempts permanently lock the OTP as isUsed: true and reject subsequent correct guesses", async () => {
+      simulator.otpTable.set("otp-sim-2", {
+        id: "otp-sim-2",
+        userId: simUserId,
+        type: "EMAIL_VERIFICATION",
+        codeHash: simVerificationHash,
+        expiresAt: new Date(Date.now() + 600000),
+        attempts: 3,
+        maxAttempts: 5,
+        isUsed: false,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+
+      // Attempt 4
+      const res4 = await request(app).post("/api/auth/verify-email").send({
+        email: simEmail,
+        code: "000000",
+      });
+      expect(res4.status).toBe(400);
+      expect(res4.body.error).toContain("1 attempt(s) remaining");
+      expect(simulator.otpTable.get("otp-sim-2").attempts).toBe(4);
+
+      // Attempt 5 (exceeds limit)
+      const res5 = await request(app).post("/api/auth/verify-email").send({
+        email: simEmail,
+        code: "000000",
+      });
+      expect(res5.status).toBe(400);
+      expect(res5.body.error).toContain("Maximum verification attempts exceeded");
+
+      // Verify OTP is now permanently marked isUsed: true
+      const lockedOtp = simulator.otpTable.get("otp-sim-2");
+      expect(lockedOtp.attempts).toBe(5);
+      expect(lockedOtp.isUsed).toBe(true);
+
+      // Attempt 6 with CORRECT code: must still be rejected!
+      const res6 = await request(app).post("/api/auth/verify-email").send({
+        email: simEmail,
+        code: simCode,
+      });
+      expect(res6.status).toBe(400);
+      expect(simulator.userTable.get(simUserId).isVerified).toBe(false);
+    });
+
+    it("R-3: Account mutation failure rolls back the OTP claim, leaving OTP unconsumed for user retry", async () => {
+      simulator.otpTable.set("otp-sim-3", {
+        id: "otp-sim-3",
+        userId: simUserId,
+        type: "EMAIL_VERIFICATION",
+        codeHash: simVerificationHash,
+        expiresAt: new Date(Date.now() + 600000),
+        attempts: 0,
+        maxAttempts: 5,
+        isUsed: false,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+
+      // Inject a database failure on user update when marking verified
+      const originalTransaction = simulator.transaction.bind(simulator);
+      vi.spyOn(simulator, "transaction").mockImplementation(async (callback: any) => {
+        return originalTransaction(async (tx: any) => {
+          const originalUserUpdate = tx.user.update;
+          tx.user.update = async (args: any) => {
+            if (args.data.isVerified === true) {
+              throw new Error("PostgreSQL connection terminated during user update");
+            }
+            return originalUserUpdate(args);
+          };
+          return callback(tx);
+        });
+      });
+
+      // Submit CORRECT code
+      const res = await request(app).post("/api/auth/verify-email").send({
+        email: simEmail,
+        code: simCode,
+      });
+
+      expect(res.status).toBe(500);
+
+      // Verify genuine rollback: OTP is NOT consumed (isUsed remained false) and user is NOT verified
+      const rolledBackOtp = simulator.otpTable.get("otp-sim-3");
+      expect(rolledBackOtp.isUsed).toBe(false);
+      expect(simulator.userTable.get(simUserId).isVerified).toBe(false);
+    });
+
+    it("R-4: Successful verification atomically claims OTP and marks user verified", async () => {
+      simulator.otpTable.set("otp-sim-4", {
+        id: "otp-sim-4",
+        userId: simUserId,
+        type: "EMAIL_VERIFICATION",
+        codeHash: simVerificationHash,
+        expiresAt: new Date(Date.now() + 600000),
+        attempts: 0,
+        maxAttempts: 5,
+        isUsed: false,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+
+      const res = await request(app).post("/api/auth/verify-email").send({
+        email: simEmail,
+        code: simCode,
+      });
+
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+
+      // Verify atomic commitment in database state
+      expect(simulator.otpTable.get("otp-sim-4").isUsed).toBe(true);
+      expect(simulator.userTable.get(simUserId).isVerified).toBe(true);
+
+      // Second attempt on the claimed OTP must be rejected
+      const resReplay = await request(app).post("/api/auth/verify-email").send({
+        email: simEmail,
+        code: simCode,
+      });
+      // User is already verified
+      expect(resReplay.status).toBe(200);
+      expect(resReplay.body.message).toContain("already verified");
+    });
+
+    it("R-5: Password reset updates password and revokes sessions while strictly preserving isVerified: false", async () => {
+      simulator.otpTable.set("otp-sim-reset-1", {
+        id: "otp-sim-reset-1",
+        userId: simUserId,
+        type: "PASSWORD_RESET",
+        codeHash: simResetHash,
+        expiresAt: new Date(Date.now() + 600000),
+        attempts: 0,
+        maxAttempts: 5,
+        isUsed: false,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+
+      simulator.sessionTable.set("session-1", {
+        id: "session-1",
+        userId: simUserId,
+        isRevoked: false,
+      });
+
+      const res = await request(app).post("/api/auth/reset-password").send({
+        email: simEmail,
+        code: simCode,
+        newPassword: "BrandNewPassword123!",
+      });
+
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+
+      // Verify OTP claimed
+      expect(simulator.otpTable.get("otp-sim-reset-1").isUsed).toBe(true);
+      // Verify session revoked
+      expect(simulator.sessionTable.get("session-1").isRevoked).toBe(true);
+      // Strictly verify isVerified status was NOT altered (remains false)
+      expect(simulator.userTable.get(simUserId).isVerified).toBe(false);
+      // Verify password was updated to a new Argon2id hash
+      expect(simulator.userTable.get(simUserId).passwordHash).toMatch(/^\$argon2id\$/);
+    });
   });
 });

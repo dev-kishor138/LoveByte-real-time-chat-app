@@ -17,19 +17,44 @@ enum MessageType {
   VOICE
 }
 
+enum OtpType {
+  EMAIL_VERIFICATION
+  PASSWORD_RESET
+}
+
 model User {
   id                   String         @id @default(uuid())
   email                String         @unique
   passwordHash         String
   displayName          String?
   lastSeenAt           DateTime?
+  isVerified           Boolean        @default(false)
   createdAt            DateTime       @default(now())
   updatedAt            DateTime       @updatedAt
 
   sessions             Session[]
+  otpCodes             OtpCode[]
   conversationsAsUser1 Conversation[] @relation("User1")
   conversationsAsUser2 Conversation[] @relation("User2")
   sentMessages         Message[]      @relation("SentMessages")
+}
+
+model OtpCode {
+  id          String   @id @default(uuid())
+  userId      String
+  type        OtpType
+  codeHash    String
+  expiresAt   DateTime
+  attempts    Int      @default(0)
+  maxAttempts Int      @default(5)
+  isUsed      Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, type, isUsed])
+  @@index([expiresAt])
 }
 
 model Session {

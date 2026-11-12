@@ -4,7 +4,16 @@ import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import { prisma } from "../../config/prisma";
 import { env } from "../../config/env";
-import { RegisterInput, LoginInput, ChangePasswordInput } from "./auth.validation";
+import {
+  RegisterInput,
+  LoginInput,
+  ChangePasswordInput,
+  VerifyEmailInput,
+  ResendOtpInput,
+  ForgotPasswordInput,
+  ResetPasswordInput,
+} from "./auth.validation";
+import { emailService } from "../../services/email/email.service";
 import { logger } from "../../utils/logger";
 import { isCanonicalUuid } from "../../utils/uuid";
 import {
@@ -28,6 +37,7 @@ const ARGON2_OPTIONS = {
 export interface SafeUser {
   id: string;
   email: string;
+  isVerified?: boolean;
   displayName?: string | null;
   lastSeenAt?: Date | null;
   createdAt: Date;
@@ -35,6 +45,8 @@ export interface SafeUser {
 
 export interface RegisterResponse {
   user: SafeUser;
+  requiresVerification?: boolean;
+  message?: string;
 }
 
 export interface LoginResponse {
@@ -50,6 +62,12 @@ export interface RefreshResponse {
 }
 
 export class AuthService {
+  private db: typeof prisma;
+
+  constructor(prismaClient?: typeof prisma) {
+    this.db = prismaClient || prisma;
+  }
+
   /**
    * Hashes a plaintext password using Argon2id with OWASP-recommended parameters.
    */
@@ -80,6 +98,49 @@ export class AuthService {
    */
   hashRefreshToken(token: string): string {
     return crypto.createHash("sha256").update(token).digest("hex");
+  }
+
+  /**
+   * Generates a cryptographically secure 6-digit numeric OTP string.
+   */
+  generateOtp(): string {
+    return crypto.randomInt(100000, 1000000).toString();
+  }
+
+  /**
+   * Constructs an unambiguous length-prefixed context binding payload for OTP HMAC computation:
+   * "v1:{len(userId)}:{userId}:{len(type)}:{type}:{len(code)}:{code}"
+   * This guarantees that fields cannot collide or be manipulated via delimiter spoofing.
+   */
+  buildOtpContextPayload(userId: string, type: string, code: string): string {
+    return `v1:${userId.length}:${userId}:${type.length}:${type}:${code.length}:${code}`;
+  }
+
+  /**
+   * Computes HMAC-SHA256 digest of an OTP cryptographically bound to userId and OTP type
+   * using the secret server-side pepper.
+   * The pepper is stored strictly in server environment configuration.
+   */
+  hashOtp(userId: string, type: string, code: string): string {
+    if (!env.OTP_PEPPER || env.OTP_PEPPER.length < 32) {
+      throw new Error("Server configuration error: OTP_PEPPER is missing or insufficient");
+    }
+    const contextPayload = this.buildOtpContextPayload(userId, type, code);
+    return crypto.createHmac("sha256", env.OTP_PEPPER).update(contextPayload).digest("hex");
+  }
+
+  /**
+   * Verifies an OTP code using constant-time comparison against stored HMAC digest
+   * bound to the target userId and OTP type.
+   */
+  verifyOtp(userId: string, type: string, code: string, expectedHash: string): boolean {
+    const candidateHash = this.hashOtp(userId, type, code);
+    const candidateBuffer = Buffer.from(candidateHash, "hex");
+    const expectedBuffer = Buffer.from(expectedHash, "hex");
+    if (candidateBuffer.length !== expectedBuffer.length) {
+      return false;
+    }
+    return crypto.timingSafeEqual(candidateBuffer, expectedBuffer);
   }
 
   /**
@@ -115,39 +176,117 @@ export class AuthService {
 
   /**
    * Registers a new user with a valid Gmail address and Argon2id hashed password.
-   * Returns only safe user metadata; never exposes password or hash.
+   * Newly registered accounts start unverified (isVerified: false).
+   * Generates and dispatches a cryptographically secure 6-digit OTP code.
+   * If an unverified account already exists with the same email, refreshes password and dispatches a new OTP.
    */
   async register(input: RegisterInput): Promise<RegisterResponse> {
     const normalizedEmail = input.email.trim().toLowerCase();
 
     // Check for existing account with the normalized email
-    const existing = await prisma.user.findUnique({
+    const existing = await this.db.user.findUnique({
       where: { email: normalizedEmail },
     });
 
     if (existing) {
-      const error = new Error("An account with this email already exists");
-      (error as any).statusCode = 409;
-      throw error;
+      // If user is already verified (or verified by default in legacy records), reject duplicate registration
+      if (existing.isVerified !== false) {
+        const error = new Error("An account with this email already exists");
+        (error as any).statusCode = 409;
+        throw error;
+      }
+
+      // Existing unverified account: update password hash and issue fresh verification OTP
+      const passwordHash = await this.hashPassword(input.password);
+      const otp = this.generateOtp();
+      const codeHash = this.hashOtp(existing.id, "EMAIL_VERIFICATION", otp);
+      const expiresAt = new Date(Date.now() + env.OTP_EXPIRES_MINUTES * 60 * 1000);
+
+      const createdOtp = await this.db.$transaction(async (tx) => {
+        await tx.user.update({
+          where: { id: existing.id },
+          data: { passwordHash },
+        });
+
+        // Invalidate existing unused verification OTPs
+        await tx.otpCode.updateMany({
+          where: { userId: existing.id, type: "EMAIL_VERIFICATION", isUsed: false },
+          data: { isUsed: true },
+        });
+
+        return tx.otpCode.create({
+          data: {
+            userId: existing.id,
+            type: "EMAIL_VERIFICATION",
+            codeHash,
+            expiresAt,
+            maxAttempts: env.OTP_MAX_ATTEMPTS,
+          },
+        });
+      });
+
+      try {
+        await emailService.sendVerificationEmail(normalizedEmail, otp);
+      } catch (deliveryError) {
+        await this.db.otpCode.delete({ where: { id: createdOtp.id } }).catch(() => {});
+        logger.error("Failed to deliver verification email on re-registration", {
+          userId: existing.id,
+          error: deliveryError instanceof Error ? deliveryError.message : "Delivery failure",
+        });
+        const error = new Error("Failed to deliver verification email. Please try registering again.");
+        (error as any).statusCode = 502;
+        throw error;
+      }
+
+      return {
+        user: {
+          id: existing.id,
+          email: existing.email,
+          createdAt: existing.createdAt,
+        },
+        requiresVerification: true,
+        message: "Verification code sent to your email. Please verify your account.",
+      };
     }
 
     // Hash password with Argon2id before persistence
     const passwordHash = await this.hashPassword(input.password);
+    const otp = this.generateOtp();
+    const expiresAt = new Date(Date.now() + env.OTP_EXPIRES_MINUTES * 60 * 1000);
 
-    // Persist new user in database
     let user;
+    let createdOtp;
     try {
-      user = await prisma.user.create({
-        data: {
-          email: normalizedEmail,
-          passwordHash,
-        },
-        select: {
-          id: true,
-          email: true,
-          createdAt: true,
-        },
+      const txResult = await this.db.$transaction(async (tx) => {
+        const newUser = await tx.user.create({
+          data: {
+            email: normalizedEmail,
+            passwordHash,
+            isVerified: false,
+          },
+          select: {
+            id: true,
+            email: true,
+            createdAt: true,
+          },
+        });
+
+        const codeHash = this.hashOtp(newUser.id, "EMAIL_VERIFICATION", otp);
+
+        const newOtp = await tx.otpCode.create({
+          data: {
+            userId: newUser.id,
+            type: "EMAIL_VERIFICATION",
+            codeHash,
+            expiresAt,
+            maxAttempts: env.OTP_MAX_ATTEMPTS,
+          },
+        });
+
+        return { user: newUser, otp: newOtp };
       });
+      user = txResult.user;
+      createdOtp = txResult.otp;
     } catch (error: unknown) {
       if (
         typeof error === "object" &&
@@ -162,17 +301,33 @@ export class AuthService {
       throw error;
     }
 
+    try {
+      await emailService.sendVerificationEmail(normalizedEmail, otp);
+    } catch (deliveryError) {
+      await this.db.otpCode.delete({ where: { id: createdOtp.id } }).catch(() => {});
+      await this.db.user.delete({ where: { id: user.id } }).catch(() => {});
+      logger.error("Failed to deliver verification email on new registration", {
+        userId: user.id,
+        error: deliveryError instanceof Error ? deliveryError.message : "Delivery failure",
+      });
+      const error = new Error("Failed to deliver verification email. Please try registering again.");
+      (error as any).statusCode = 502;
+      throw error;
+    }
+
     return {
       user: {
         id: user.id,
         email: user.email,
         createdAt: user.createdAt,
       },
+      requiresVerification: true,
+      message: "Verification code sent to your email. Please verify your account.",
     };
   }
 
   /**
-   * Authenticates user credentials, creates a persistent session record,
+   * Authenticates user credentials, verifies account activation, creates a persistent session record,
    * and issues a 15-minute access token and a 30-day rotating refresh token.
    */
   async login(
@@ -181,7 +336,7 @@ export class AuthService {
   ): Promise<LoginResponse> {
     const normalizedEmail = input.email.trim().toLowerCase();
 
-    const user = await prisma.user.findUnique({
+    const user = await this.db.user.findUnique({
       where: { email: normalizedEmail },
     });
 
@@ -198,13 +353,22 @@ export class AuthService {
       throw error;
     }
 
+    // Enforce email verification status: unverified accounts cannot sign in
+    if (user.isVerified === false) {
+      const error = new Error("Email not verified. Please verify your email before signing in.");
+      (error as any).statusCode = 403;
+      (error as any).code = "EMAIL_NOT_VERIFIED";
+      (error as any).email = user.email;
+      throw error;
+    }
+
     const rawRefreshToken = this.generateRefreshToken();
     const tokenHash = this.hashRefreshToken(rawRefreshToken);
     const expiresAt = new Date(
       Date.now() + env.REFRESH_TOKEN_EXPIRES_DAYS * 24 * 60 * 60 * 1000
     );
 
-    const session = await prisma.session.create({
+    const session = await this.db.session.create({
       data: {
         userId: user.id,
         tokenHash,
@@ -244,7 +408,7 @@ export class AuthService {
     const tokenHash = this.hashRefreshToken(refreshToken);
 
     // 1. Initial lookup by token hash
-    const session = await prisma.session.findFirst({
+    const session = await this.db.session.findFirst({
       where: { tokenHash },
     });
 
@@ -264,7 +428,7 @@ export class AuthService {
       });
 
       try {
-        await prisma.session.updateMany({
+        await this.db.session.updateMany({
           where: { familyId: session.familyId },
           data: { isRevoked: true },
         });
@@ -297,7 +461,7 @@ export class AuthService {
       | { status: "COLLISION"; familyId: string; userId: string }
       | { status: "SUCCESS"; accessToken: string; refreshToken: string };
 
-    const txResult: TxResult = await prisma.$transaction(async (tx) => {
+    const txResult: TxResult = await this.db.$transaction(async (tx) => {
       // Conditionally claim the session: update isRevoked = true ONLY if isRevoked is STILL false.
       const claimResult = await tx.session.updateMany({
         where: {
@@ -365,7 +529,7 @@ export class AuthService {
       });
 
       try {
-        await prisma.session.updateMany({
+        await this.db.session.updateMany({
           where: { familyId: txResult.familyId },
           data: { isRevoked: true },
         });
@@ -401,7 +565,7 @@ export class AuthService {
     // 1. If refreshToken is supplied, verify it belongs to the authenticated user and active session
     if (options.refreshToken) {
       const tokenHash = this.hashRefreshToken(options.refreshToken);
-      const session = await prisma.session.findFirst({
+      const session = await this.db.session.findFirst({
         where: { tokenHash },
       });
 
@@ -433,7 +597,7 @@ export class AuthService {
       }
 
       // Atomically revoke
-      const result = await prisma.session.updateMany({
+      const result = await this.db.session.updateMany({
         where: { id: session.id, isRevoked: false },
         data: { isRevoked: true },
       });
@@ -452,7 +616,7 @@ export class AuthService {
 
     // 2. If no refreshToken supplied, revoke by verified sessionId from the access token
     if (options.sessionId) {
-      const result = await prisma.session.updateMany({
+      const result = await this.db.session.updateMany({
         where: {
           id: options.sessionId,
           userId: options.userId,
@@ -464,7 +628,7 @@ export class AuthService {
       });
 
       if (result.count === 0) {
-        const session = await prisma.session.findUnique({
+        const session = await this.db.session.findUnique({
           where: { id: options.sessionId },
         });
 
@@ -494,7 +658,7 @@ export class AuthService {
    * Retrieves user profile by verified token user ID.
    */
   async getProfile(userId: string): Promise<SafeUser> {
-    const user = await prisma.user.findUnique({
+    const user = await this.db.user.findUnique({
       where: { id: userId },
       select: {
         id: true,
@@ -524,7 +688,7 @@ export class AuthService {
     userId: string,
     input: ChangePasswordInput
   ): Promise<{ success: boolean; message: string }> {
-    const user = await prisma.user.findUnique({
+    const user = await this.db.user.findUnique({
       where: { id: userId },
       select: { id: true, passwordHash: true },
     });
@@ -544,7 +708,7 @@ export class AuthService {
 
     const newHash = await this.hashPassword(input.newPassword);
 
-    await prisma.$transaction(async (tx) => {
+    await this.db.$transaction(async (tx) => {
       // 1. Update password hash
       await tx.user.update({
         where: { id: userId },
@@ -582,7 +746,7 @@ export class AuthService {
     const cutoffDate = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000);
     const now = new Date();
 
-    const deleteResult = await prisma.session.deleteMany({
+    const deleteResult = await this.db.session.deleteMany({
       where: {
         AND: [
           {
@@ -606,6 +770,527 @@ export class AuthService {
     return {
       deletedCount: deleteResult.count,
       cutoffDate,
+    };
+  }
+
+  /**
+   * Verifies a user's email using a 6-digit OTP.
+   * Enforces 15-minute expiration, atomic 5-attempt brute-force protection,
+   * constant-time HMAC comparison, and concurrency-safe single-use claiming.
+   */
+  async verifyEmail(input: VerifyEmailInput): Promise<{ success: boolean; message: string }> {
+    const normalizedEmail = input.email.trim().toLowerCase();
+
+    const user = await this.db.user.findUnique({
+      where: { email: normalizedEmail },
+    });
+
+    if (!user) {
+      const error = new Error("Invalid verification code or email");
+      (error as any).statusCode = 400;
+      throw error;
+    }
+
+    if (user.isVerified) {
+      return { success: true, message: "Email is already verified. You can log in." };
+    }
+
+    // Standardized Lock Order: Acquire exclusive User row lock first, then read and mutate OtpCode.
+    // Concurrency & Persistence Guarantee: Failed attempt increments are COMMITTED inside the transaction,
+    // returning an unsuccess status rather than throwing inside tx, ensuring PostgreSQL NEVER rolls back attempts.
+    const result = await this.db.$transaction(async (tx) => {
+      // 1. Acquire exclusive lock on the User row to serialize concurrent requests and eliminate deadlocks
+      await tx.user.update({
+        where: { id: user.id },
+        data: { updatedAt: new Date() },
+      });
+
+      // 2. Re-read active verification code inside the locked transaction
+      const otpRecord = await tx.otpCode.findFirst({
+        where: {
+          userId: user.id,
+          type: "EMAIL_VERIFICATION",
+          isUsed: false,
+        },
+        orderBy: { createdAt: "desc" },
+      });
+
+      if (!otpRecord) {
+        return { status: "NOT_FOUND" as const };
+      }
+
+      // Check expiration
+      if (otpRecord.expiresAt < new Date()) {
+        return { status: "EXPIRED" as const };
+      }
+
+      // Check attempt limits
+      if (otpRecord.attempts >= otpRecord.maxAttempts) {
+        return { status: "MAX_ATTEMPTS_EXCEEDED" as const };
+      }
+
+      // 3. Verify HMAC with constant-time comparison
+      const isValid = this.verifyOtp(user.id, "EMAIL_VERIFICATION", input.code, otpRecord.codeHash);
+      if (!isValid) {
+        const nextAttempts = otpRecord.attempts + 1;
+        const reachedMax = nextAttempts >= otpRecord.maxAttempts;
+
+        const updated = await tx.otpCode.update({
+          where: { id: otpRecord.id },
+          data: {
+            attempts: { increment: 1 },
+            ...(reachedMax ? { isUsed: true } : {}),
+          },
+          select: { attempts: true, maxAttempts: true },
+        });
+
+        const remaining = Math.max(0, updated.maxAttempts - updated.attempts);
+        return {
+          status: "INVALID_CODE" as const,
+          remaining,
+        };
+      }
+
+      // 4. Atomic single-use claim prevents race condition / double-spend
+      const claim = await tx.otpCode.updateMany({
+        where: {
+          id: otpRecord.id,
+          isUsed: false,
+        },
+        data: {
+          isUsed: true,
+        },
+      });
+
+      if (claim.count === 0) {
+        return { status: "ALREADY_USED" as const };
+      }
+
+      // 5. Mark user verified in the same transaction
+      await tx.user.update({
+        where: { id: user.id },
+        data: { isVerified: true },
+      });
+
+      // 6. Invalidate any remaining unused verification codes for this user
+      await tx.otpCode.updateMany({
+        where: {
+          userId: user.id,
+          type: "EMAIL_VERIFICATION",
+          isUsed: false,
+        },
+        data: { isUsed: true },
+      });
+
+      return { status: "SUCCESS" as const };
+    });
+
+    if (result.status === "NOT_FOUND") {
+      const error = new Error("No active verification code found. Please request a new one.");
+      (error as any).statusCode = 400;
+      throw error;
+    }
+
+    if (result.status === "EXPIRED") {
+      const error = new Error("Verification code has expired. Please request a new one.");
+      (error as any).statusCode = 400;
+      (error as any).code = "OTP_EXPIRED";
+      throw error;
+    }
+
+    if (result.status === "MAX_ATTEMPTS_EXCEEDED") {
+      const error = new Error("Maximum verification attempts exceeded. Please request a new code.");
+      (error as any).statusCode = 400;
+      (error as any).code = "OTP_MAX_ATTEMPTS_EXCEEDED";
+      throw error;
+    }
+
+    if (result.status === "INVALID_CODE") {
+      const error = new Error(
+        result.remaining > 0
+          ? `Invalid verification code. ${result.remaining} attempt(s) remaining.`
+          : "Maximum verification attempts exceeded. Please request a new code."
+      );
+      (error as any).statusCode = 400;
+      (error as any).code = result.remaining > 0 ? "OTP_INVALID" : "OTP_MAX_ATTEMPTS_EXCEEDED";
+      throw error;
+    }
+
+    if (result.status === "ALREADY_USED") {
+      const error = new Error("Verification code has already been used");
+      (error as any).statusCode = 400;
+      (error as any).code = "OTP_ALREADY_USED";
+      throw error;
+    }
+
+    logger.info("User email verified successfully", { userId: user.id });
+
+    return {
+      success: true,
+      message: "Email verified successfully. You can now log in.",
+    };
+  }
+
+  /**
+   * Resends an OTP (EMAIL_VERIFICATION or PASSWORD_RESET) enforcing a 60-second cooldown.
+   * Uses atomic serialization via row lock to prevent duplicate concurrent generation.
+   * Returns a generic response to prevent account enumeration if the account does not exist.
+   */
+  async resendOtp(input: ResendOtpInput): Promise<{ message: string }> {
+    const normalizedEmail = input.email.trim().toLowerCase();
+
+    const user = await this.db.user.findUnique({
+      where: { email: normalizedEmail },
+    });
+
+    // Account enumeration defense: return generic response if user not found
+    if (!user) {
+      return { message: "If an account exists with this email, a new code has been sent." };
+    }
+
+    if (input.type === "EMAIL_VERIFICATION" && user.isVerified) {
+      return { message: "Email is already verified. You can log in." };
+    }
+
+    const otp = this.generateOtp();
+    const codeHash = this.hashOtp(user.id, input.type, otp);
+    const expiresAt = new Date(Date.now() + env.OTP_EXPIRES_MINUTES * 60 * 1000);
+
+    const createdRecord = await this.db.$transaction(async (tx) => {
+      // Serialize concurrent requests for this user via user row touch lock
+      await tx.user.update({
+        where: { id: user.id },
+        data: { updatedAt: new Date() },
+      });
+
+      // Check 60-second cooldown against the latest OTP of this type
+      const latestOtp = await tx.otpCode.findFirst({
+        where: {
+          userId: user.id,
+          type: input.type,
+        },
+        orderBy: { createdAt: "desc" },
+      });
+
+      if (latestOtp) {
+        const elapsedMs = Date.now() - latestOtp.createdAt.getTime();
+        const cooldownMs = env.OTP_COOLDOWN_SECONDS * 1000;
+        if (elapsedMs < cooldownMs) {
+          const remainingSeconds = Math.ceil((cooldownMs - elapsedMs) / 1000);
+          const error = new Error(`Please wait ${remainingSeconds} seconds before requesting a new code.`);
+          (error as any).statusCode = 429;
+          (error as any).code = "OTP_COOLDOWN";
+          (error as any).retryAfter = remainingSeconds;
+          throw error;
+        }
+      }
+
+      // Invalidate existing unused codes of this type
+      await tx.otpCode.updateMany({
+        where: {
+          userId: user.id,
+          type: input.type,
+          isUsed: false,
+        },
+        data: { isUsed: true },
+      });
+
+      return tx.otpCode.create({
+        data: {
+          userId: user.id,
+          type: input.type,
+          codeHash,
+          expiresAt,
+          maxAttempts: env.OTP_MAX_ATTEMPTS,
+        },
+      });
+    });
+
+    try {
+      if (input.type === "EMAIL_VERIFICATION") {
+        await emailService.sendVerificationEmail(user.email, otp);
+      } else {
+        await emailService.sendPasswordResetEmail(user.email, otp);
+      }
+    } catch (deliveryError) {
+      await this.db.otpCode.delete({ where: { id: createdRecord.id } }).catch(() => {});
+      logger.error("Failed to deliver resent OTP email", {
+        userId: user.id,
+        type: input.type,
+        error: deliveryError instanceof Error ? deliveryError.message : "Delivery failure",
+      });
+      const error = new Error("Failed to deliver verification code email. Please try again later.");
+      (error as any).statusCode = 502;
+      throw error;
+    }
+
+    return { message: "A new code has been sent to your email." };
+  }
+
+  /**
+   * Initiates password reset by issuing a 6-digit OTP.
+   * Uses generic responses to completely eliminate account enumeration.
+   */
+  async forgotPassword(input: ForgotPasswordInput): Promise<{ message: string }> {
+    const normalizedEmail = input.email.trim().toLowerCase();
+    const genericSuccess = {
+      message: "If an account exists with this email, a password reset code has been sent.",
+    };
+
+    const user = await this.db.user.findUnique({
+      where: { email: normalizedEmail },
+    });
+
+    // Account enumeration defense: return generic response if user not found or unverified
+    if (!user || user.isVerified === false) {
+      return genericSuccess;
+    }
+
+    const otp = this.generateOtp();
+    const codeHash = this.hashOtp(user.id, "PASSWORD_RESET", otp);
+    const expiresAt = new Date(Date.now() + env.OTP_EXPIRES_MINUTES * 60 * 1000);
+
+    let createdRecord;
+    try {
+      createdRecord = await this.db.$transaction(async (tx) => {
+        // Serialize concurrent requests for this user via user row touch lock
+        await tx.user.update({
+          where: { id: user.id },
+          data: { updatedAt: new Date() },
+        });
+
+        // Check 60-second cooldown
+        const latestOtp = await tx.otpCode.findFirst({
+          where: {
+            userId: user.id,
+            type: "PASSWORD_RESET",
+          },
+          orderBy: { createdAt: "desc" },
+        });
+
+        if (latestOtp) {
+          const elapsedMs = Date.now() - latestOtp.createdAt.getTime();
+          const cooldownMs = env.OTP_COOLDOWN_SECONDS * 1000;
+          if (elapsedMs < cooldownMs) {
+            const remainingSeconds = Math.ceil((cooldownMs - elapsedMs) / 1000);
+            const error = new Error(`Please wait ${remainingSeconds} seconds before requesting another reset code.`);
+            (error as any).statusCode = 429;
+            (error as any).code = "OTP_COOLDOWN";
+            (error as any).retryAfter = remainingSeconds;
+            throw error;
+          }
+        }
+
+        // Invalidate existing unused PASSWORD_RESET codes
+        await tx.otpCode.updateMany({
+          where: {
+            userId: user.id,
+            type: "PASSWORD_RESET",
+            isUsed: false,
+          },
+          data: { isUsed: true },
+        });
+
+        return tx.otpCode.create({
+          data: {
+            userId: user.id,
+            type: "PASSWORD_RESET",
+            codeHash,
+            expiresAt,
+            maxAttempts: env.OTP_MAX_ATTEMPTS,
+          },
+        });
+      });
+    } catch (err: unknown) {
+      throw err;
+    }
+
+    try {
+      await emailService.sendPasswordResetEmail(user.email, otp);
+    } catch (deliveryError) {
+      await this.db.otpCode.delete({ where: { id: createdRecord.id } }).catch(() => {});
+      logger.error("Failed to deliver password reset email", {
+        userId: user.id,
+        error: deliveryError instanceof Error ? deliveryError.message : "Delivery failure",
+      });
+      // CRITICAL ANTI-ENUMERATION: Never return a distinguishable HTTP 502 response for an existing account
+      // when an unknown account receives a generic HTTP 200 response. Both must return the identical generic success message.
+      return genericSuccess;
+    }
+
+    return genericSuccess;
+  }
+
+  /**
+   * Completes password reset using a verified 6-digit OTP.
+   * Hashes new password with Argon2id, revokes all sessions, and disconnects all active sockets.
+   * Atomic conditional claim eliminates concurrent replay or double-spending.
+   */
+  async resetPassword(input: ResetPasswordInput): Promise<{ success: boolean; message: string }> {
+    const normalizedEmail = input.email.trim().toLowerCase();
+
+    const user = await this.db.user.findUnique({
+      where: { email: normalizedEmail },
+    });
+
+    if (!user) {
+      const error = new Error("Invalid reset code or email");
+      (error as any).statusCode = 400;
+      throw error;
+    }
+
+    // Pre-hash password before transaction to minimize database lock hold time
+    const newHash = await this.hashPassword(input.newPassword);
+
+    // Standardized Lock Order: Acquire exclusive User row lock first, then read and mutate OtpCode.
+    // Concurrency & Persistence Guarantee: Failed attempt increments are COMMITTED inside the transaction,
+    // returning an unsuccess status rather than throwing inside tx, ensuring PostgreSQL NEVER rolls back attempts.
+    const result = await this.db.$transaction(async (tx) => {
+      // 1. Acquire exclusive lock on the User row to standardize lock order and serialize concurrent requests
+      await tx.user.update({
+        where: { id: user.id },
+        data: { updatedAt: new Date() },
+      });
+
+      // 2. Re-read the latest unused PASSWORD_RESET OTP inside the locked transaction
+      const otpRecord = await tx.otpCode.findFirst({
+        where: {
+          userId: user.id,
+          type: "PASSWORD_RESET",
+          isUsed: false,
+        },
+        orderBy: { createdAt: "desc" },
+      });
+
+      if (!otpRecord) {
+        return { status: "NOT_FOUND" as const };
+      }
+
+      if (otpRecord.expiresAt < new Date()) {
+        return { status: "EXPIRED" as const };
+      }
+
+      if (otpRecord.attempts >= otpRecord.maxAttempts) {
+        return { status: "MAX_ATTEMPTS_EXCEEDED" as const };
+      }
+
+      // 3. Verify HMAC with constant-time comparison
+      const isValid = this.verifyOtp(user.id, "PASSWORD_RESET", input.code, otpRecord.codeHash);
+      if (!isValid) {
+        const nextAttempts = otpRecord.attempts + 1;
+        const reachedMax = nextAttempts >= otpRecord.maxAttempts;
+
+        const updated = await tx.otpCode.update({
+          where: { id: otpRecord.id },
+          data: {
+            attempts: { increment: 1 },
+            ...(reachedMax ? { isUsed: true } : {}),
+          },
+          select: { attempts: true, maxAttempts: true },
+        });
+
+        const remaining = Math.max(0, updated.maxAttempts - updated.attempts);
+        return {
+          status: "INVALID_CODE" as const,
+          remaining,
+        };
+      }
+
+      // 4. Atomic single-use claim prevents race condition / double-spend
+      const claim = await tx.otpCode.updateMany({
+        where: {
+          id: otpRecord.id,
+          isUsed: false,
+        },
+        data: {
+          isUsed: true,
+        },
+      });
+
+      if (claim.count === 0) {
+        return { status: "ALREADY_USED" as const };
+      }
+
+      // 5. Update password hash (strictly preserve existing isVerified status to prevent accidental verification bypass)
+      await tx.user.update({
+        where: { id: user.id },
+        data: {
+          passwordHash: newHash,
+        },
+      });
+
+      // 6. Revoke all active sessions for this user
+      await tx.session.updateMany({
+        where: { userId: user.id, isRevoked: false },
+        data: { isRevoked: true },
+      });
+
+      // 7. Invalidate any remaining unused PASSWORD_RESET codes for this user
+      await tx.otpCode.updateMany({
+        where: {
+          userId: user.id,
+          type: "PASSWORD_RESET",
+          isUsed: false,
+        },
+        data: { isUsed: true },
+      });
+
+      return { status: "SUCCESS" as const };
+    });
+
+    if (result.status === "NOT_FOUND") {
+      const error = new Error("No active password reset request found. Please request a new code.");
+      (error as any).statusCode = 400;
+      throw error;
+    }
+
+    if (result.status === "EXPIRED") {
+      const error = new Error("Reset code has expired. Please request a new one.");
+      (error as any).statusCode = 400;
+      (error as any).code = "OTP_EXPIRED";
+      throw error;
+    }
+
+    if (result.status === "MAX_ATTEMPTS_EXCEEDED") {
+      const error = new Error("Maximum verification attempts exceeded. Please request a new reset code.");
+      (error as any).statusCode = 400;
+      (error as any).code = "OTP_MAX_ATTEMPTS_EXCEEDED";
+      throw error;
+    }
+
+    if (result.status === "INVALID_CODE") {
+      const error = new Error(
+        result.remaining > 0
+          ? `Invalid reset code. ${result.remaining} attempt(s) remaining.`
+          : "Maximum reset attempts exceeded. Please request a new code."
+      );
+      (error as any).statusCode = 400;
+      (error as any).code = result.remaining > 0 ? "OTP_INVALID" : "OTP_MAX_ATTEMPTS_EXCEEDED";
+      throw error;
+    }
+
+    if (result.status === "ALREADY_USED") {
+      const error = new Error("Reset code has already been used");
+      (error as any).statusCode = 400;
+      (error as any).code = "OTP_ALREADY_USED";
+      throw error;
+    }
+
+    // Post-commit: disconnect all user sockets
+    try {
+      disconnectSocketsByUserId(
+        user.id,
+        "Password reset successfully. All active sessions have been revoked. Please log in again."
+      );
+    } catch (err) {
+      logger.warn("Could not disconnect sockets on password reset", { userId: user.id, error: err });
+    }
+
+    logger.info("Password reset successfully and all sessions revoked", { userId: user.id });
+
+    return {
+      success: true,
+      message: "Password reset successfully. All active sessions have been revoked. You can now log in with your new password.",
     };
   }
 }

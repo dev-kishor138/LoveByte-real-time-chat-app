@@ -108,6 +108,54 @@ export class AuthController {
       next(error);
     }
   }
+
+  /**
+   * Verify email using 6-digit OTP.
+   */
+  async verifyEmail(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const result = await authService.verifyEmail(req.body);
+      res.status(200).json(result);
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  /**
+   * Resend OTP code for email verification or password reset.
+   */
+  async resendOtp(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const result = await authService.resendOtp(req.body);
+      res.status(200).json(result);
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  /**
+   * Request password reset code.
+   */
+  async forgotPassword(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const result = await authService.forgotPassword(req.body);
+      res.status(200).json(result);
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  /**
+   * Reset password with 6-digit OTP and new password.
+   */
+  async resetPassword(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const result = await authService.resetPassword(req.body);
+      res.status(200).json(result);
+    } catch (error) {
+      next(error);
+    }
+  }
 }
 
 export const authController = new AuthController();

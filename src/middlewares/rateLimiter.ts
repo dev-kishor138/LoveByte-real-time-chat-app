@@ -4,6 +4,7 @@ import rateLimit, { MemoryStore } from "express-rate-limit";
 export const authStore = new MemoryStore();
 export const refreshStore = new MemoryStore();
 export const apiStore = new MemoryStore();
+export const otpStore = new MemoryStore();
 
 /**
  * Strict rate limiter for authentication endpoints (login, register).
@@ -17,6 +18,20 @@ export const authRateLimiter = rateLimit({
   legacyHeaders: false,
   message: {
     error: "Too many authentication attempts, please try again later.",
+  },
+});
+
+/**
+ * Dedicated rate limiter for OTP verification, resend, and password recovery.
+ */
+export const otpRateLimiter = rateLimit({
+  store: otpStore,
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 15, // Limit each IP to 15 OTP requests per windowMs
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    error: "Too many verification attempts, please try again later.",
   },
 });
 
@@ -59,6 +74,7 @@ export function resetRateLimiters(): void {
   authStore.resetAll();
   refreshStore.resetAll();
   apiStore.resetAll();
+  otpStore.resetAll();
 }
 
 

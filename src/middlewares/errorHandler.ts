@@ -4,6 +4,10 @@ import { logger } from "../utils/logger";
 
 export interface AppError extends Error {
   statusCode?: number;
+  code?: string;
+  email?: string;
+  retryAfter?: number;
+  details?: unknown;
 }
 
 /**
@@ -25,9 +29,15 @@ export function errorHandler(
     statusCode,
   });
 
-  res.status(statusCode).json({
+  const responseBody: Record<string, unknown> = {
     error: statusCode === 500 && isProd ? "Internal Server Error" : err.message,
-    ...(isProd ? {} : { stack: err.stack }),
-  });
+  };
+
+  if (err.code) responseBody.code = err.code;
+  if (err.email) responseBody.email = err.email;
+  if (err.retryAfter !== undefined) responseBody.retryAfter = err.retryAfter;
+  if (!isProd && err.stack) responseBody.stack = err.stack;
+
+  res.status(statusCode).json(responseBody);
 }
 

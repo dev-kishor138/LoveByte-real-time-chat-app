@@ -78,6 +78,11 @@ export async function authenticateToken(
         userId: true,
         isRevoked: true,
         expiresAt: true,
+        user: {
+          select: {
+            isVerified: true,
+          },
+        },
       },
     });
 
@@ -103,6 +108,11 @@ export async function authenticateToken(
 
     if (session.expiresAt <= new Date()) {
       res.status(401).json({ error: "Session has expired" });
+      return;
+    }
+
+    if (session.user && !session.user.isVerified) {
+      res.status(403).json({ error: "Email not verified. Please verify your email before continuing." });
       return;
     }
   } catch (error) {

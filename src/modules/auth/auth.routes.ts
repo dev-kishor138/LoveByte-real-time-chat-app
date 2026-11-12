@@ -7,8 +7,16 @@ import {
   refreshTokenSchema,
   logoutSchema,
   changePasswordSchema,
+  verifyEmailSchema,
+  resendOtpSchema,
+  forgotPasswordSchema,
+  resetPasswordSchema,
 } from "./auth.validation";
-import { authRateLimiter, refreshRateLimiter } from "../../middlewares/rateLimiter";
+import {
+  authRateLimiter,
+  refreshRateLimiter,
+  otpRateLimiter,
+} from "../../middlewares/rateLimiter";
 import { authenticateToken } from "../../middlewares/auth";
 
 const router = Router();
@@ -27,6 +35,38 @@ router.post(
   authRateLimiter,
   validateRequest({ body: loginSchema }),
   (req, res, next) => authController.login(req, res, next)
+);
+
+// Email verification route
+router.post(
+  "/verify-email",
+  otpRateLimiter,
+  validateRequest({ body: verifyEmailSchema }),
+  (req, res, next) => authController.verifyEmail(req, res, next)
+);
+
+// Resend OTP route
+router.post(
+  "/resend-otp",
+  otpRateLimiter,
+  validateRequest({ body: resendOtpSchema }),
+  (req, res, next) => authController.resendOtp(req, res, next)
+);
+
+// Forgot password route
+router.post(
+  "/forgot-password",
+  otpRateLimiter,
+  validateRequest({ body: forgotPasswordSchema }),
+  (req, res, next) => authController.forgotPassword(req, res, next)
+);
+
+// Reset password route
+router.post(
+  "/reset-password",
+  otpRateLimiter,
+  validateRequest({ body: resetPasswordSchema }),
+  (req, res, next) => authController.resetPassword(req, res, next)
 );
 
 // Refresh token rotation route with dedicated rate limiting
